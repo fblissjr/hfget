@@ -20,17 +20,35 @@ try:
         scan_cache_dir,
         list_repo_files_info,
     )
+
+    # --- FIX 1: Import RepositoryNotFoundError ---
     from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
     from huggingface_hub.hf_api import RepoFile
 except ImportError:
     missing = []
+    # --- FIX 1: Add RepositoryNotFoundError to the check list ---
     for lib in ["structlog", "huggingface_hub", "tabulate", "humanize"]:
         try:
+            # Check if the main library exists
             __import__(lib)
+            # Specifically check if RepositoryNotFoundError can be imported if huggingface_hub exists
+            if lib == "huggingface_hub":
+                from huggingface_hub.utils import RepositoryNotFoundError
         except ImportError:
-            missing.append(lib)
+            # Append the library name if it's missing
+            if lib not in missing:
+                missing.append(lib)
+            # If huggingface_hub is present but the specific exception is missing (unlikely but possible)
+            elif (
+                lib == "huggingface_hub" and "RepositoryNotFoundError" not in globals()
+            ):
+                missing.append(f"{lib} (or specific utils/errors submodule)")
+
     if missing:
-        raise ImportError(f"Required libraries not found: {', '.join(missing)}. Install with: pip install {' '.join(missing)}")
+        raise ImportError(
+            f"Required libraries not found: {', '.join(missing)}. Install/update with: pip install --upgrade {' '.join(m.split(' ')[0] for m in missing)}"
+        )  # Suggest upgrade
+
 
 class HfHubOrganizer:
     """
@@ -122,10 +140,22 @@ class HfHubOrganizer:
 
         # Keep track of effective paths
         self.effective_paths = {
-            "HF_HOME": os.path.expanduser(os.environ.get("HF_HOME", "~/.cache/huggingface")),
-            "HF_HUB_CACHE": os.path.expanduser(os.environ.get("HF_HUB_CACHE", "")),
-            "structured_root": self.structured_root
+            "HF_HOME": os.path.expanduser(
+                os.environ.get("HF_HOME", "~/.cache/huggingface")
+            ),
+            "HF_HUB_CACHE": os.path.expanduser(
+                os.environ.get(
+                    "HF_HUB_CACHE",
+                    os.path.join(
+                        os.environ.get("HF_HOME", "~/.cache/huggingface"), "hub"
+                    ),
+                )
+            ),  # Ensure default hub path is derived correctly
+            "structured_root": self.structured_root,
         }
+        # Ensure HF_HUB_CACHE is explicitly set if derived, as other parts rely on it
+        if "HF_HUB_CACHE" not in os.environ or not os.environ["HF_HUB_CACHE"]:
+            os.environ["HF_HUB_CACHE"] = self.effective_paths["HF_HUB_CACHE"]
 
         self.logger.info(
             "initialized",
@@ -264,7 +294,16 @@ class HfHubOrganizer:
                 # Simple expansion loop (might need more robust solution for complex cases)
                 for _ in range(3):  # Limit expansion depth
                     updated = False
-                    for var_name, var_value in os.environ.items():
+                    # Use current os.environ for expansion lookup
+                    env_dict = os.environ
+                    # Temporarily add HF_HOME if it's being defined based on ~
+                    if key == "HF_HOME" and "~" in default_value:
+                        env_dict = {
+                            **os.environ,
+                            "HF_HOME": os.path.expanduser(default_value),
+                        }
+
+                    for var_name, var_value in env_dict.items():
                         placeholder = "${" + var_name + "}"
                         if placeholder in expanded_value:
                             expanded_value = expanded_value.replace(
@@ -299,11 +338,9 @@ class HfHubOrganizer:
             if "/" in repo_id:
                 namespace, repo_name = repo_id.split("/", 1)
                 try:
-                    # Use API to get the actual type
-                    repo_info = self.api.repo_info(
-                        repo_id=repo_id
-                    )  # Fetches type and other info
-                    repo_type = repo_info.repo_type
+                    # --- FIX 2: Use api.repo_type() instead of repo_info.repo_type ---
+                    repo_type = self.api.repo_type(repo_id=repo_id)
+                    # --- End FIX 2 ---
                     if repo_type == "dataset":
                         repo_type_guess = "datasets"
                     elif repo_type == "space":
@@ -316,6 +353,7 @@ class HfHubOrganizer:
                         category=repo_type_guess,
                     )
                 except RepositoryNotFoundError:
+                    # This exception should now be defined thanks to FIX 1
                     self.logger.error("repo_not_found_api", repo_id=repo_id)
                     raise  # Re-raise the specific error
                 except Exception as e:
@@ -362,22 +400,32 @@ class HfHubOrganizer:
 
     def _link_or_copy(self, cache_path: str, org_path: str, symlink_to_cache: bool):
         """Helper to symlink or copy a file/directory."""
-        if os.path.exists(org_path):
+        if os.path.lexists(org_path):  # Use lexists to check for broken symlinks too
             if os.path.islink(org_path) or os.path.isfile(org_path):
                 os.remove(org_path)
                 self.logger.debug("removed_existing_target", path=org_path)
             elif os.path.isdir(org_path):
-                # Be careful removing directories - ensure it's intended
-                # For snapshot downloads, we might replace the whole dir
-                shutil.rmtree(org_path)
-                self.logger.debug("removed_existing_target_dir", path=org_path)
+                # Ensure we are not removing the cache path itself if symlinking fails
+                if not os.path.samefile(
+                    os.path.realpath(org_path), os.path.realpath(cache_path)
+                ):
+                    shutil.rmtree(org_path)
+                    self.logger.debug("removed_existing_target_dir", path=org_path)
+                else:
+                    self.logger.warning(
+                        "skipping_removal_target_is_cache", path=org_path
+                    )
 
         os.makedirs(os.path.dirname(org_path), exist_ok=True)  # Ensure parent exists
 
         if symlink_to_cache:
             try:
-                os.symlink(cache_path, org_path)
-                self.logger.debug("symlink_created", source=cache_path, target=org_path)
+                # Ensure cache_path is absolute for reliable symlinking
+                abs_cache_path = os.path.abspath(cache_path)
+                os.symlink(abs_cache_path, org_path)
+                self.logger.debug(
+                    "symlink_created", source=abs_cache_path, target=org_path
+                )
             except OSError as e:
                 self.logger.error(
                     "symlink_failed", source=cache_path, target=org_path, error=str(e)
@@ -387,7 +435,9 @@ class HfHubOrganizer:
         else:
             try:
                 if os.path.isdir(cache_path):
-                    shutil.copytree(cache_path, org_path)
+                    shutil.copytree(
+                        cache_path, org_path, symlinks=True
+                    )  # Preserve symlinks within copied structure if any
                     self.logger.debug(
                         "directory_copied", source=cache_path, target=org_path
                     )
@@ -428,7 +478,11 @@ class HfHubOrganizer:
 
             # Save metadata about this download attempt (even if it fails later)
             self._save_download_metadata(
-                org_repo_path, repo_id, detected_category, filename, subfolder
+                org_repo_path,
+                repo_id,
+                detected_category,
+                filename or "entire_repo",
+                subfolder,
             )
 
             downloaded_path_in_cache: str
@@ -444,6 +498,7 @@ class HfHubOrganizer:
                     repo_type=detected_category
                     if detected_category in ["models", "datasets", "spaces"]
                     else None,
+                    token=self.api.token,  # Pass token
                     **kwargs,
                 )
                 # Target path in the organized structure
@@ -463,6 +518,7 @@ class HfHubOrganizer:
                     repo_type=detected_category
                     if detected_category in ["models", "datasets", "spaces"]
                     else None,
+                    token=self.api.token,  # Pass token
                     **kwargs,
                 )
                 # Target path is the directory itself
@@ -472,15 +528,29 @@ class HfHubOrganizer:
                 # the contents correctly into the target org_download_path.
 
                 # Remove existing target dir before linking/copying contents
-                if os.path.exists(final_organized_path):
+                if os.path.lexists(final_organized_path):  # Use lexists for symlinks
                     if os.path.islink(final_organized_path):
                         os.remove(final_organized_path)
-                    else:
-                        shutil.rmtree(final_organized_path)
-                    self.logger.debug(
-                        "removed_existing_target_dir_for_snapshot",
-                        path=final_organized_path,
-                    )
+                    elif os.path.isdir(final_organized_path):
+                        # Check if it points to the cache before removing
+                        if not os.path.samefile(
+                            os.path.realpath(final_organized_path),
+                            os.path.realpath(downloaded_path_in_cache),
+                        ):
+                            shutil.rmtree(final_organized_path)
+                            self.logger.debug(
+                                "removed_existing_target_dir_for_snapshot",
+                                path=final_organized_path,
+                            )
+                        else:
+                            self.logger.warning(
+                                "skipping_removal_snapshot_target_is_cache",
+                                path=final_organized_path,
+                            )
+
+                    else:  # It's a file? Remove it.
+                        os.remove(final_organized_path)
+
                 os.makedirs(final_organized_path, exist_ok=True)
 
                 # Link or copy contents item by item
@@ -521,7 +591,6 @@ class HfHubOrganizer:
             )
             raise  # Re-raise for CLI handling
 
-    # --- MODIFIED METHOD (no code changes needed inside, logic handled in main) ---
     def download_recent(
         self,
         repo_id: str,
@@ -585,7 +654,11 @@ class HfHubOrganizer:
                         # file_info.path is relative to repo root
                         # Ensure consistent trailing slash handling for comparison
                         norm_subfolder = subfolder.strip("/")
-                        if file_info.path.startswith(norm_subfolder + "/"):
+                        # Check if path starts with subfolder/ or is exactly subfolder (if it's a file)
+                        if (
+                            file_info.path == norm_subfolder
+                            or file_info.path.startswith(norm_subfolder + "/")
+                        ):
                             recent_files_to_download.append(file_info)
                             self.logger.debug(
                                 "found_recent_file_in_subfolder",
@@ -659,6 +732,9 @@ class HfHubOrganizer:
                             relative_file_path = os.path.relpath(
                                 file_info.path, norm_subfolder
                             )
+                        # Handle case where the file itself is the subfolder target (unlikely but possible)
+                        elif file_info.path == norm_subfolder:
+                            relative_file_path = os.path.basename(file_info.path)
 
                     final_organized_path = os.path.join(
                         org_download_path, relative_file_path
@@ -700,6 +776,7 @@ class HfHubOrganizer:
             return org_download_path  # Return the base path where files were placed
 
         except RepositoryNotFoundError:
+            # This exception should now be defined
             self.logger.error("download_failed_repo_not_found", repo_id=repo_id)
             raise
         except Exception as e:
@@ -859,10 +936,16 @@ class HfHubOrganizer:
                     repo_dir_name = path_parts[-3]  # e.g., models--google--flan-t5-base
 
                     # Prevent processing the same snapshot dir multiple times if traversed via symlink
-                    real_path = os.path.realpath(root)
-                    if real_path in processed_dirs:
+                    try:
+                        real_path = os.path.realpath(root)
+                        if real_path in processed_dirs:
+                            continue
+                        processed_dirs.add(real_path)
+                    except (
+                        OSError
+                    ):  # Handle cases where realpath might fail (e.g., broken links)
+                        self.logger.warning("realpath_failed_skipping_dir", path=root)
                         continue
-                    processed_dirs.add(real_path)
 
                     # Decode repo_id and type
                     repo_type = "unknown"
@@ -891,11 +974,16 @@ class HfHubOrganizer:
                             if os.path.isfile(item_path) and not os.path.islink(
                                 item_path
                             ):
-                                file_size = os.path.getsize(item_path)
-                                dir_size += file_size
-                                file_count += 1
-                                if file_size > largest_file["size"]:
-                                    largest_file = {"name": item, "size": file_size}
+                                try:
+                                    file_size = os.path.getsize(item_path)
+                                    dir_size += file_size
+                                    file_count += 1
+                                    if file_size > largest_file["size"]:
+                                        largest_file = {"name": item, "size": file_size}
+                                except OSError:
+                                    self.logger.warning(
+                                        "getsize_failed_file", path=item_path
+                                    )
                             elif os.path.isdir(item_path) and not os.path.islink(
                                 item_path
                             ):
@@ -906,16 +994,24 @@ class HfHubOrganizer:
                                         if os.path.isfile(
                                             sub_file_path
                                         ) and not os.path.islink(sub_file_path):
-                                            file_size = os.path.getsize(sub_file_path)
-                                            dir_size += file_size
-                                            file_count += 1
-                                            if file_size > largest_file["size"]:
-                                                largest_file = {
-                                                    "name": os.path.relpath(
-                                                        sub_file_path, root
-                                                    ),
-                                                    "size": file_size,
-                                                }
+                                            try:
+                                                file_size = os.path.getsize(
+                                                    sub_file_path
+                                                )
+                                                dir_size += file_size
+                                                file_count += 1
+                                                if file_size > largest_file["size"]:
+                                                    largest_file = {
+                                                        "name": os.path.relpath(
+                                                            sub_file_path, root
+                                                        ),
+                                                        "size": file_size,
+                                                    }
+                                            except OSError:
+                                                self.logger.warning(
+                                                    "getsize_failed_subfile",
+                                                    path=sub_file_path,
+                                                )
 
                     except OSError as e:
                         self.logger.warning(
@@ -1044,7 +1140,7 @@ class HfHubOrganizer:
 
         Args:
             older_than_days: Remove snapshots older than this many days.
-            min_size_mb: Only consider snapshots larger than this size in MB for removal.
+            min_size_mb: Only consider snapshots larger than this size in MB for removal criteria (removes if >=).
             dry_run: If True, only report what would be removed.
 
         Returns:
@@ -1071,72 +1167,28 @@ class HfHubOrganizer:
 
         # --- Filtering Logic ---
         for item in cache_items:
-            keep_item = False  # Default to removing unless a keep condition is met
-
-            # --- Age Check ---
+            # Determine if item meets criteria for removal
+            meets_age_criteria = False
             if older_than_days is not None:
                 if item["last_modified"]:
                     try:
-                        # Ensure last_modified is timezone-aware (should be UTC from scan)
                         last_mod_dt = datetime.datetime.fromisoformat(
                             item["last_modified"]
                         )
                         if last_mod_dt.tzinfo is None:
-                            # If somehow timezone is missing, assume UTC for comparison
                             last_mod_dt = last_mod_dt.replace(
                                 tzinfo=datetime.timezone.utc
                             )
-
-                        age_days = (now_utc - last_mod_dt).days
-                        if age_days < older_than_days:
-                            keep_item = True  # Keep if newer than threshold
-                            self.logger.debug(
-                                "keeping_item_age",
-                                repo_id=item["repo_id"],
-                                revision=item["revision"],
-                                age_days=age_days,
-                            )
-                        else:
-                            self.logger.debug(
-                                "marking_item_age",
-                                repo_id=item["repo_id"],
-                                revision=item["revision"],
-                                age_days=age_days,
-                            )
-
+                        if (now_utc - last_mod_dt).days >= older_than_days:
+                            meets_age_criteria = True
                     except ValueError:
                         self.logger.warning(
-                            "invalid_date_format_skipping_age_check",
+                            "invalid_date_format_for_clean",
                             repo_id=item["repo_id"],
                             revision=item["revision"],
                             date_str=item["last_modified"],
                         )
-                        keep_item = True  # Keep if date is invalid
-                else:
-                    keep_item = True  # Keep if no modification date available
-                    self.logger.debug(
-                        "keeping_item_no_date",
-                        repo_id=item["repo_id"],
-                        revision=item["revision"],
-                    )
-
-            # --- Size Check (Applied only if age check didn't already decide to keep) ---
-            # Note: Logic needs refinement. Do we remove based on *either* condition or *both*?
-            # Current logic: Remove if *not* kept by age check *and* meets size criteria (if specified).
-            # Let's adjust: Remove if EITHER (older than N days) OR (smaller than M MB)? No, usually AND.
-            # Common use case: Remove items OLDER than N days AND LARGER than M MB.
-            # Let's implement: Remove if (older_than condition met) AND (size condition met)
-
-            meets_age_criteria = False
-            if older_than_days is not None and item["last_modified"]:
-                try:
-                    last_mod_dt = datetime.datetime.fromisoformat(
-                        item["last_modified"]
-                    ).replace(tzinfo=datetime.timezone.utc)
-                    if (now_utc - last_mod_dt).days >= older_than_days:
-                        meets_age_criteria = True
-                except ValueError:
-                    pass  # Ignore invalid dates for criteria
+                # else: keep if no date? Or remove? Let's default to keeping if date is missing.
 
             meets_size_criteria = False
             if min_size_mb is not None:
@@ -1144,10 +1196,10 @@ class HfHubOrganizer:
                 if size_mb >= min_size_mb:
                     meets_size_criteria = True
 
-            # Determine if removal criteria are met based on specified args
+            # Decide whether to remove based on provided arguments
             should_remove = False
             if older_than_days is not None and min_size_mb is not None:
-                # Must meet BOTH age and size criteria if both are given
+                # Must meet BOTH age and size criteria
                 if meets_age_criteria and meets_size_criteria:
                     should_remove = True
             elif older_than_days is not None:
@@ -1155,12 +1207,10 @@ class HfHubOrganizer:
                 if meets_age_criteria:
                     should_remove = True
             elif min_size_mb is not None:
-                # Only size criteria given (remove if larger than) - less common use case?
-                # Let's assume min_size means "remove if SMALLER than" for cleanup? No, description implies larger.
-                # Let's stick to: Remove if meets size criteria (>= min_size_mb)
+                # Only size criteria given
                 if meets_size_criteria:
                     should_remove = True
-            # If neither criteria is given, should_remove remains False (don't remove anything)
+            # If neither criteria is given, should_remove remains False
 
             if should_remove:
                 items_to_remove.append(item)
@@ -1768,6 +1818,7 @@ def main():
                     ]
                     print(tabulate(table, headers=headers))
 
+
         elif args.command == "list":
             downloads = organizer.list_downloads(
                 limit=args.limit,
@@ -1886,7 +1937,7 @@ def main():
 
 
     except RepositoryNotFoundError as e:
-        # Handle specific errors gracefully
+        # Handle specific errors gracefully - This should now work
         organizer.logger.error(
             "command_failed_repo_not_found",
             repo_id=getattr(args, "repo_id", "N/A"),
