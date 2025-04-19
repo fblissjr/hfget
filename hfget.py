@@ -9,6 +9,7 @@ import humanize
 from tabulate import tabulate
 import argparse
 import logging  # Standard library logging for level constants
+import re  # Import regex for case-insensitive check
 
 try:
     import structlog
@@ -520,7 +521,7 @@ class HfHubOrganizer:
             )
             raise  # Re-raise for CLI handling
 
-    # --- NEW METHOD ---
+    # --- MODIFIED METHOD (no code changes needed inside, logic handled in main) ---
     def download_recent(
         self,
         repo_id: str,
@@ -533,6 +534,7 @@ class HfHubOrganizer:
     ) -> str:
         """
         Download only files modified within the last N days for a repository.
+        Assumes repo_id has already been validated against exclusion patterns by the caller (main).
         """
         start_time = time.time()
         self.logger.info(
@@ -581,7 +583,9 @@ class HfHubOrganizer:
                     # Check if the file is within the requested subfolder (if specified)
                     if subfolder:
                         # file_info.path is relative to repo root
-                        if file_info.path.startswith(subfolder.strip("/") + "/"):
+                        # Ensure consistent trailing slash handling for comparison
+                        norm_subfolder = subfolder.strip("/")
+                        if file_info.path.startswith(norm_subfolder + "/"):
                             recent_files_to_download.append(file_info)
                             self.logger.debug(
                                 "found_recent_file_in_subfolder",
@@ -650,9 +654,11 @@ class HfHubOrganizer:
                     relative_file_path = file_info.path  # Path relative to repo root
                     if subfolder:
                         # Adjust relative path if user requested a subfolder download
-                        relative_file_path = os.path.relpath(
-                            file_info.path, subfolder.strip("/")
-                        )
+                        norm_subfolder = subfolder.strip("/")
+                        if file_info.path.startswith(norm_subfolder + "/"):
+                            relative_file_path = os.path.relpath(
+                                file_info.path, norm_subfolder
+                            )
 
                     final_organized_path = os.path.join(
                         org_download_path, relative_file_path
@@ -723,7 +729,7 @@ class HfHubOrganizer:
         metadata = {"downloads": []}
         if os.path.exists(metadata_file):
             try:
-                with open(metadata_file, 'r') as f:
+                with open(metadata_file, "r") as f:
                     metadata = json.load(f)
                     if not isinstance(metadata.get("downloads"), list):
                         self.logger.warning(
@@ -1460,7 +1466,12 @@ def _create_parser() -> argparse.ArgumentParser:
     download_recent_parser.add_argument(
         "--copy", action="store_true", help="Copy files instead of symlinking."
     )
-    # Allow/ignore patterns might be less relevant here as we download file-by-file
+    # --- ADDED ARGUMENT ---
+    download_recent_parser.add_argument(
+        "--exclude-repo-pattern",
+        help="Skip download if this case-insensitive text is found in the repo_id.",
+    )
+    # --- END ADDED ARGUMENT ---
 
     # --- Profile Management Command ---
     profile_parser = subparsers.add_parser(
@@ -1661,6 +1672,22 @@ def main():
             print(f"\nDownload complete. Organized at: {path}")
 
         elif args.command == "download-recent":
+            # --- ADDED CHECK ---
+            if args.exclude_repo_pattern and re.search(
+                args.exclude_repo_pattern, args.repo_id, re.IGNORECASE
+            ):
+                print(
+                    f"Skipping repository '{args.repo_id}' because it matches exclusion pattern '{args.exclude_repo_pattern}'."
+                )
+                organizer.logger.info(
+                    "repo_skipped_exclusion",
+                    repo_id=args.repo_id,
+                    pattern=args.exclude_repo_pattern,
+                )
+                # Exit gracefully or just return depending on desired behavior when excluded
+                return  # Exit the main function, effectively skipping the download
+            # --- END ADDED CHECK ---
+
             path = organizer.download_recent(
                 repo_id=args.repo_id,
                 days_ago=args.days,
@@ -1856,6 +1883,7 @@ def main():
                             tabulate(table, headers=headers, tablefmt="plain")
                         )  # Use plain for less clutter
                         print()
+
 
     except RepositoryNotFoundError as e:
         # Handle specific errors gracefully
