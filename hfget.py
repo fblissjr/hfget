@@ -14,16 +14,22 @@ import re  # Import regex for case-insensitive check
 try:
     import structlog
 
-    # --- FIX 3: Add list_repo_files_info to imports ---
+    # --- FIX 4: Remove list_repo_files_info, keep needed imports ---
     from huggingface_hub import (
         HfApi,
         snapshot_download,
         hf_hub_download,
         scan_cache_dir,
-        list_repo_files_info,  # <-- Added import
+        # list_repo_files_info <-- Removed
     )
     from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
-    from huggingface_hub.hf_api import RepoFile
+
+    # RepoFile is needed for type hinting and isinstance check
+    from huggingface_hub.hf_api import (
+        RepoFile,
+        RepoFolder,
+        RepoInfo,
+    )  # Added RepoFolder, RepoInfo
 except ImportError:
     missing = []
     # Check main libraries first
@@ -40,15 +46,15 @@ except ImportError:
             from huggingface_hub.utils import RepositoryNotFoundError
         except ImportError:
             missing.append("huggingface_hub.utils (RepositoryNotFoundError)")
+        # Removed check for list_repo_files_info
         try:
-            # --- FIX 3: Also check list_repo_files_info here ---
-            from huggingface_hub import list_repo_files_info
+            from huggingface_hub.hf_api import (
+                RepoFile,
+                RepoFolder,
+                RepoInfo,
+            )  # Added RepoFolder, RepoInfo
         except ImportError:
-            missing.append("huggingface_hub (list_repo_files_info)")
-        try:
-            from huggingface_hub.hf_api import RepoFile
-        except ImportError:
-            missing.append("huggingface_hub.hf_api (RepoFile)")
+            missing.append("huggingface_hub.hf_api (RepoFile/RepoFolder/RepoInfo)")
 
     if missing:
         # Make suggestion more robust
@@ -59,7 +65,6 @@ except ImportError:
         raise ImportError(
             f"Required libraries/components not found: {', '.join(missing)}. Install/update with: pip install --upgrade {' '.join(install_libs)}"
         )
-
 
 class HfHubOrganizer:
     """
@@ -418,15 +423,20 @@ class HfHubOrganizer:
                 # Ensure we are not removing the cache path itself if symlinking fails
                 # Use realpath to resolve symlinks before comparison
                 try:
-                    if not os.path.samefile(
-                        os.path.realpath(org_path), os.path.realpath(cache_path)
+                    # Check if cache_path exists before comparing
+                    if (
+                        os.path.exists(cache_path)
+                        and os.path.exists(org_path)
+                        and os.path.samefile(
+                            os.path.realpath(org_path), os.path.realpath(cache_path)
+                        )
                     ):
-                        shutil.rmtree(org_path)
-                        self.logger.debug("removed_existing_target_dir", path=org_path)
-                    else:
                         self.logger.warning(
                             "skipping_removal_target_is_cache", path=org_path
                         )
+                    else:
+                        shutil.rmtree(org_path)
+                        self.logger.debug("removed_existing_target_dir", path=org_path)
                 except FileNotFoundError:
                     # If realpath fails (e.g., broken link target), safe to remove the link/dir itself
                     shutil.rmtree(org_path)
@@ -563,18 +573,22 @@ class HfHubOrganizer:
                     elif os.path.isdir(final_organized_path):
                         # Check if it points to the cache before removing
                         try:
-                            if not os.path.samefile(
-                                os.path.realpath(final_organized_path),
-                                os.path.realpath(downloaded_path_in_cache),
+                            if (
+                                os.path.exists(downloaded_path_in_cache)
+                                and os.path.exists(final_organized_path)
+                                and os.path.samefile(
+                                    os.path.realpath(final_organized_path),
+                                    os.path.realpath(downloaded_path_in_cache),
+                                )
                             ):
-                                shutil.rmtree(final_organized_path)
-                                self.logger.debug(
-                                    "removed_existing_target_dir_for_snapshot",
+                                self.logger.warning(
+                                    "skipping_removal_snapshot_target_is_cache",
                                     path=final_organized_path,
                                 )
                             else:
-                                self.logger.warning(
-                                    "skipping_removal_snapshot_target_is_cache",
+                                shutil.rmtree(final_organized_path)
+                                self.logger.debug(
+                                    "removed_existing_target_dir_for_snapshot",
                                     path=final_organized_path,
                                 )
                         except FileNotFoundError:
@@ -681,48 +695,52 @@ class HfHubOrganizer:
             )
 
             # Get file info including commit details
-            # Use token explicitly if needed, otherwise API client uses env var
-            # --- This call should now work because list_repo_files_info is imported ---
-            all_files_info: List[RepoFile] = list_repo_files_info(
+            # --- FIX 4: Use self.api.list_repo_tree instead ---
+            self.logger.debug("fetching_repo_tree", repo_id=repo_id, revision=revision)
+            repo_tree_iter = self.api.list_repo_tree(
                 repo_id=repo_id,
                 revision=revision,
-                # repo_type=detected_category if detected_category in ["models", "datasets", "spaces"] else None, # repo_type not needed here
+                recursive=True,  # Need to check files in subdirectories
                 token=self.api.token,  # Pass token from initialized API client
             )
 
             # Filter files based on last commit date
             recent_files_to_download: List[RepoFile] = []
-            for file_info in all_files_info:
-                # Ensure commit info and date exist, and compare with cutoff
+            # Iterate through the generator returned by list_repo_tree
+            for item in repo_tree_iter:
+                # --- FIX 4: Check if item is a file and has commit info ---
                 if (
-                    file_info.last_commit
-                    and file_info.last_commit.date
-                    and file_info.last_commit.date > cutoff_date
+                    isinstance(item, RepoFile)
+                    and item.lastCommit is not None
+                    and item.lastCommit.date is not None
                 ):
-                    # Check if the file is within the requested subfolder (if specified)
-                    if subfolder:
-                        # file_info.path is relative to repo root
-                        # Ensure consistent trailing slash handling for comparison
-                        norm_subfolder = subfolder.strip("/")
-                        # Check if path starts with subfolder/ or is exactly subfolder (if it's a file)
-                        if (
-                            file_info.path == norm_subfolder
-                            or file_info.path.startswith(norm_subfolder + "/")
-                        ):
+                    file_info = item  # It's a file with commit info
+                    if file_info.lastCommit.date > cutoff_date:
+                        # Check if the file is within the requested subfolder (if specified)
+                        if subfolder:
+                            # file_info.path is relative to repo root
+                            # Ensure consistent trailing slash handling for comparison
+                            norm_subfolder = subfolder.strip("/")
+                            # Check if path starts with subfolder/ or is exactly subfolder (if it's a file)
+                            if (
+                                file_info.path == norm_subfolder
+                                or file_info.path.startswith(norm_subfolder + "/")
+                            ):
+                                recent_files_to_download.append(file_info)
+                                self.logger.debug(
+                                    "found_recent_file_in_subfolder",
+                                    file=file_info.path,
+                                    commit_date=file_info.lastCommit.date,
+                                )
+                        else:
+                            # No subfolder specified, include all recent files
                             recent_files_to_download.append(file_info)
                             self.logger.debug(
-                                "found_recent_file_in_subfolder",
+                                "found_recent_file",
                                 file=file_info.path,
-                                commit_date=file_info.last_commit.date,
+                                commit_date=file_info.lastCommit.date,
                             )
-                    else:
-                        # No subfolder specified, include all recent files
-                        recent_files_to_download.append(file_info)
-                        self.logger.debug(
-                            "found_recent_file",
-                            file=file_info.path,
-                            commit_date=file_info.last_commit.date,
-                        )
+                # --- End FIX 4 checks ---
 
             if not recent_files_to_download:
                 self.logger.info(
