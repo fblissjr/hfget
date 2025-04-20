@@ -41,8 +41,11 @@ def _create_parser() -> argparse.ArgumentParser:
     download_parser.add_argument("--filename", "-f", help="Specific file to download within the repo.")
     download_parser.add_argument("--subfolder", "-s", help="Subfolder within the repository to download from/into.")
     download_parser.add_argument("--revision", "-r", help="Git revision (branch, tag, commit hash) to download.")
-    download_parser.add_argument("--category", choices=["models", "datasets", "spaces"],
-                        help="Manually specify category for organization (overrides auto-detection).")
+    download_parser.add_argument(
+        "--category",
+        choices=["model", "dataset", "space"],
+        help="Manually specify category for organization (overrides auto-detection).",
+    )
     download_parser.add_argument("--base-path", help="Override HF_HOME (cache location) for this command (takes precedence over profile).")
     download_parser.add_argument("--out-dir", help="Override structured organization root directory for this command (takes precedence over profile).")
     download_parser.add_argument("--copy", action="store_true", help="Copy files from cache instead of symlinking.")
@@ -56,8 +59,11 @@ def _create_parser() -> argparse.ArgumentParser:
     download_recent_parser.add_argument("--days", "-d", type=int, required=True, help="Download files modified within the last N days.")
     download_recent_parser.add_argument("--subfolder", "-s", help="Only consider files within this subfolder.")
     download_recent_parser.add_argument("--revision", "-r", help="Git revision (branch, tag, commit hash) to check.")
-    download_recent_parser.add_argument("--category", choices=["models", "datasets", "spaces"],
-                        help="Manually specify category for organization.")
+    download_recent_parser.add_argument(
+        "--category",
+        choices=["model", "dataset", "space"],
+        help="Manually specify category for organization.",
+    )
     download_recent_parser.add_argument("--base-path", help="Override HF_HOME (cache location).")
     download_recent_parser.add_argument("--out-dir", help="Override structured organization root directory.")
     download_recent_parser.add_argument("--copy", action="store_true", help="Copy files instead of symlinking.")
@@ -94,7 +100,9 @@ def _create_parser() -> argparse.ArgumentParser:
     # --- List Downloads Command ---
     list_downloads_parser = subparsers.add_parser("list", help="List download history recorded by this tool.")
     list_downloads_parser.add_argument("--limit", type=int, default=20, help="Limit number of results.")
-    list_downloads_parser.add_argument("--category", choices=["models", "datasets", "spaces"], help="Filter by category.")
+    list_downloads_parser.add_argument(
+        "--category", choices=["model", "dataset", "space"], help="Filter by category."
+    )
     list_downloads_parser.add_argument("--filter-profile", help="Show history only for a specific profile name (uses that profile's metadata file).")
     list_downloads_parser.add_argument("--json", action="store_true", help="Output as JSON.")
 

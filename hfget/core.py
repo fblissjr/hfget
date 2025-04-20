@@ -22,7 +22,8 @@ from huggingface_hub import (
     HFCacheInfo,
     CommitInfo,
 )
-from huggingface_hub.hf_api import RepoFile # 
+# Import RepoFile from the correct submodule
+from huggingface_hub.hf_api import RepoFile
 from huggingface_hub.utils import RepositoryNotFoundError, HfHubHTTPError, hf_raise_for_status
 
 # --- Configuration ---
@@ -313,50 +314,70 @@ class HfHubOrganizer:
 
     def _determine_category_and_paths(self, repo_id: str, category: Optional[str] = None, subfolder: Optional[str] = None) -> Tuple[str, str, str, str]:
         """Determine the category and create the organized path structure."""
-        repo_type_guess = "models" # Default to models
+        repo_type_guess = "model"  # Default to model
         namespace = "library"
         repo_name = repo_id
 
         if "/" in repo_id:
             namespace, repo_name = repo_id.split("/", 1)
         else:
-            # Models like 'gpt2' often don't have a namespace in repo_id but live under 'library' conceptually
-            # However, repo_info needs the full ID if it exists (e.g. 'openai-community/gpt2')
-            # Let's try repo_info first, and handle the simple case if it fails
-            pass # We'll refine repo_type_guess below
+            pass  # Will attempt repo_info lookup
 
         if category is None:
             try:
-                # Use api.repo_info which returns repo_type correctly
-                # Handle cases like 'gpt2' vs 'google/flan-t5-base'
                 repo_info = self.api.repo_info(repo_id=repo_id)
-                repo_type_from_api = repo_info.repo_type
-                # Update namespace/repo_name if repo_id was simple (e.g., 'gpt2' becomes 'openai-community/gpt2')
-                # The repo_info.id will have the canonical ID
+                # FIX 1: Use getattr for robustness against missing attribute
+                repo_type_from_api = getattr(repo_info, "repo_type", None)
+
                 if "/" not in repo_id and "/" in repo_info.id:
                      namespace, repo_name = repo_info.id.split("/", 1)
 
                 if repo_type_from_api == "dataset":
-                    repo_type_guess = "datasets"
+                    repo_type_guess = "dataset"
                 elif repo_type_from_api == "space":
-                    repo_type_guess = "spaces"
-                else:
-                    repo_type_guess = "models"
+                    repo_type_guess = "space"
+                elif repo_type_from_api == "model":  # Explicitly check 'model'
+                    repo_type_guess = "model"
+                elif repo_type_from_api is not None:
+                    self.logger.warning(
+                        "unrecognized_repo_type_api",
+                        repo_id=repo_info.id,
+                        type=repo_type_from_api,
+                        fallback=repo_type_guess,
+                    )
+
                 self.logger.debug("category_detected_via_api", repo_id=repo_info.id, category=repo_type_guess)
+
             except RepositoryNotFoundError:
-                 # If repo_info fails for a simple ID like 'gpt2', it might be legacy or mistyped
-                 # Stick with default guess ('models') but log error
-                 self.logger.error("repo_not_found_api", repo_id=repo_id, action="assuming_model")
-                 repo_type_guess = "models" # Keep default guess
-                 # We already split repo_id assuming no namespace, so namespace/repo_name are correct for this case
+                self.logger.error(
+                    "repo_not_found_api", repo_id=repo_id, action="assuming_model"
+                )
+                repo_type_guess = "models"
             except HfHubHTTPError as http_err:
-                 if http_err.response.status_code == 401:
-                      self.logger.error("authentication_error_api", repo_id=repo_id, error=str(http_err))
-                      raise ValueError(f"Authentication failed for {repo_id}. Check your HF_TOKEN.") from http_err
-                 else:
-                      self.logger.warning("category_detection_http_error", repo_id=repo_id, status=http_err.response.status_code, error=str(http_err), fallback=repo_type_guess)
+                if http_err.response.status_code == 401:
+                    self.logger.error(
+                        "authentication_error_api", repo_id=repo_id, error=str(http_err)
+                    )
+                    raise ValueError(
+                        f"Authentication failed for {repo_id}. Check your HF_TOKEN."
+                    ) from http_err
+                else:
+                    self.logger.warning(
+                        "category_detection_http_error",
+                        repo_id=repo_id,
+                        status=http_err.response.status_code,
+                        error=str(http_err),
+                        fallback=repo_type_guess,
+                    )
             except Exception as e:
-                self.logger.warning("category_detection_failed_api", repo_id=repo_id, error=str(e), error_type=type(e).__name__, fallback=repo_type_guess)
+                # Catch AttributeError here specifically if getattr wasn't used, or other errors
+                self.logger.warning(
+                    "category_detection_failed_api",
+                    repo_id=repo_id,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    fallback=repo_type_guess,
+                )
         else:
             repo_type_guess = category # User override
 
@@ -457,20 +478,37 @@ class HfHubOrganizer:
             if filename:
                 self.logger.debug("downloading_single_file", **log_ctx)
                 downloaded_path_in_cache = hf_hub_download(
-                    repo_id=repo_id, filename=filename, subfolder=subfolder, revision=revision,
-                    repo_type=detected_category if detected_category in ["models", "datasets", "spaces"] else None,
-                    token=self.api.token, **kwargs
+                    repo_id=repo_id,
+                    filename=filename,
+                    subfolder=subfolder,
+                    revision=revision,
+                    repo_type=detected_category
+                    if detected_category in ["model", "dataset", "space"]
+                    else None,
+                    token=self.api.token,
+                    **kwargs,
                 )
                 final_organized_path = os.path.join(org_download_path, os.path.basename(filename))
                 self._link_or_copy(downloaded_path_in_cache, final_organized_path, symlink_to_cache)
             else:
+                # FIX 2: Remove unsupported 'subfolder' argument from snapshot_download
                 self.logger.debug("downloading_snapshot", allow_patterns=allow_patterns, ignore_patterns=ignore_patterns, **log_ctx)
+                # Note: snapshot_download downloads the whole repo (respecting patterns), not just a subfolder.
                 downloaded_path_in_cache = snapshot_download(
-                    repo_id=repo_id, subfolder=subfolder, revision=revision,
-                    repo_type=detected_category if detected_category in ["models", "datasets", "spaces"] else None,
-                    allow_patterns=allow_patterns, ignore_patterns=ignore_patterns,
-                    token=self.api.token, **kwargs
+                    repo_id=repo_id,
+                    # subfolder=subfolder, # <--- Removed this line
+                    revision=revision,
+                    repo_type=detected_category
+                    if detected_category in ["model", "dataset", "space"]
+                    else None,
+                    allow_patterns=allow_patterns,
+                    ignore_patterns=ignore_patterns,
+                    token=self.api.token,
+                    **kwargs,
                 )
+                # If a subfolder was requested by the user, the final organized path still includes it,
+                # but the download itself fetched the whole repo into the cache snapshot.
+                # We will link/copy the entire snapshot contents into the target (sub)folder.
                 final_organized_path = org_download_path
 
                 if os.path.lexists(final_organized_path):
@@ -488,6 +526,7 @@ class HfHubOrganizer:
                 items_in_cache = os.listdir(downloaded_path_in_cache)
                 for item_name in items_in_cache:
                     cache_item_path = os.path.join(downloaded_path_in_cache, item_name)
+                    # Link/copy items directly into the target path (which might be a subfolder)
                     org_item_path = os.path.join(final_organized_path, item_name)
                     self._link_or_copy(cache_item_path, org_item_path, symlink_to_cache)
                     item_count += 1
@@ -574,9 +613,15 @@ class HfHubOrganizer:
                     file_basename = os.path.basename(file_info.path)
                     self.logger.debug("downloading_individual_recent_file", file=file_info.path, **log_ctx)
                     downloaded_path_in_cache = hf_hub_download(
-                        repo_id=repo_id, filename=file_basename, subfolder=file_repo_subfolder or None, revision=revision,
-                        repo_type=detected_category if detected_category in ["models", "datasets", "spaces"] else None,
-                        token=self.api.token, **kwargs
+                        repo_id=repo_id,
+                        filename=file_basename,
+                        subfolder=file_repo_subfolder or None,
+                        revision=revision,
+                        repo_type=detected_category
+                        if detected_category in ["model", "dataset", "space"]
+                        else None,
+                        token=self.api.token,
+                        **kwargs,
                     )
 
                     relative_file_path = file_info.path
