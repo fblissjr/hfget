@@ -1,42 +1,53 @@
+#!/usr/bin/env python
 import os
 import shutil
 import json
 import time
+import datetime
+import argparse
+import logging  # Standard library logging for level constants
+import re
+import fnmatch # For pattern matching
 from pathlib import Path
 from typing import Dict, Optional, Union, List, Any, Tuple
-import datetime
-import humanize
-from tabulate import tabulate
-import argparse
-import logging # Standard library logging for level constants
-import re # Import regex for case-insensitive check
 
 import structlog
+from tabulate import tabulate
+import humanize # For user-friendly sizes
+
 from huggingface_hub import (
     HfApi,
     snapshot_download,
     hf_hub_download,
-    list_repo_files,
-    scan_cache_dir
+    list_repo_files_info, # <--- Changed from list_repo_files
+    scan_cache_dir,
+    CacheInfo,
+    CommitInfo,
+    RepoFile
 )
-from huggingface_hub.utils import RepositoryNotFoundError
-from huggingface_hub.hf_api import RepoFile
+from huggingface_hub.utils import RepositoryNotFoundError, HfHubHTTPError
+
+# --- Configuration ---
+DEFAULT_CONFIG_PATH = "~/.config/hf_organizer/config.json"
+DEFAULT_STRUCTURED_ROOT = "~/huggingface_organized"
+DEFAULT_HF_HOME = "~/.cache/huggingface"
 
 class HfHubOrganizer:
     """
-    A wrapper that makes huggingface_hub behave in a sane, organized way with support
-    for different storage profiles and advanced cache management.
+    Manages HuggingFace Hub downloads, cache, and organization with profiles.
+    Uses huggingface_hub library functions where possible.
     """
 
+    # Default environment variable values
     ENV_VARS = {
-        "HF_HOME": "~/.cache/huggingface",
+        "HF_HOME": DEFAULT_HF_HOME,
         "HF_HUB_CACHE": "${HF_HOME}/hub",
-        "HF_XET_CACHE": "${HF_HOME}/xet",
         "HF_ASSETS_CACHE": "${HF_HOME}/assets",
         "HF_TOKEN": None,
         "HF_HUB_VERBOSITY": "warning",
         "HF_HUB_ETAG_TIMEOUT": "10",
         "HF_HUB_DOWNLOAD_TIMEOUT": "10"
+        # Note: HF_XET_CACHE is not standard in huggingface_hub, removed for clarity
     }
 
     BOOLEAN_ENV_VARS = {
@@ -44,7 +55,7 @@ class HfHubOrganizer:
         "HF_HUB_OFFLINE": False,
         "HF_HUB_DISABLE_PROGRESS_BARS": False,
         "HF_HUB_DISABLE_TELEMETRY": True,  # Default to privacy-friendly
-        "HF_HUB_ENABLE_HF_TRANSFER": False
+        "HF_HUB_ENABLE_HF_TRANSFER": True   # <--- Default to True for speed
     }
 
     def __init__(
@@ -53,77 +64,84 @@ class HfHubOrganizer:
         base_path: Optional[str] = None,
         structured_root: Optional[str] = None,
         token: Optional[str] = None,
+        enable_hf_transfer: Optional[bool] = None, # Allow override via constructor/CLI
         verbose: bool = False,
         config_path: Optional[str] = None,
         log_format: str = "console"
     ):
         """Initialize with custom paths and settings."""
-        # Set config path
-        self.config_path = os.path.expanduser(config_path or "~/.config/hf_organizer/config.json")
+        self.config_path = os.path.expanduser(config_path or DEFAULT_CONFIG_PATH)
         os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
 
-        # Setup structured logging
         self.logger = self._setup_logger(verbose, log_format)
 
-        # Load or create config
         self.config = self._load_config()
         self.selected_profile = profile
+        profile_settings = {}
 
-        # Load profile settings if specified
         if profile:
             if profile not in self.config.get("profiles", {}):
                 self.logger.error("profile_not_found", profile=profile,
                                   available=list(self.config.get("profiles", {}).keys()))
                 raise ValueError(f"Profile '{profile}' not found.")
-
             profile_settings = self.config["profiles"][profile]
-            base_path = profile_settings.get("base_path", base_path)
-            structured_root = profile_settings.get("structured_root", structured_root)
-            token = profile_settings.get("token", token)
-
             self.logger.info("using_profile", profile=profile)
 
-        # Set base HF path if provided
-        if base_path:
-            os.environ["HF_HOME"] = os.path.expanduser(base_path)
+        # Determine effective settings (CLI/Constructor > Profile > Environment > Default)
+        effective_base_path = base_path or profile_settings.get("base_path") or os.environ.get("HF_HOME")
+        effective_structured_root = structured_root or profile_settings.get("structured_root") or DEFAULT_STRUCTURED_ROOT
+        effective_token = token or profile_settings.get("token") or os.environ.get("HF_TOKEN")
+        # Handle hf_transfer enable flag priority
+        if enable_hf_transfer is None: # Not set via CLI/constructor
+             # Use profile setting if available, otherwise default (True)
+             effective_enable_hf_transfer = profile_settings.get("enable_hf_transfer", self.BOOLEAN_ENV_VARS["HF_HUB_ENABLE_HF_TRANSFER"])
+        else: # Explicitly set via CLI/constructor
+             effective_enable_hf_transfer = enable_hf_transfer
 
-        # Set organized structure root
-        self.structured_root = os.path.expanduser(
-            structured_root or "~/huggingface_organized"
-        )
+
+        # Set base HF path if needed
+        if effective_base_path:
+            os.environ["HF_HOME"] = os.path.expanduser(effective_base_path)
+        elif "HF_HOME" not in os.environ: # Ensure default is set if nothing overrides
+             os.environ["HF_HOME"] = os.path.expanduser(self.ENV_VARS["HF_HOME"])
+
+
+        self.structured_root = os.path.expanduser(effective_structured_root)
         os.makedirs(self.structured_root, exist_ok=True)
 
-        # Set token if provided
-        if token:
-            os.environ["HF_TOKEN"] = token
-        elif "HF_TOKEN" not in os.environ:
-             # Use token from profile if not overridden and not in env
-             profile_token = self.config.get("profiles", {}).get(profile, {}).get("token")
-             if profile_token:
-                 os.environ["HF_TOKEN"] = profile_token
+        # Set token if needed (and not already in env)
+        if effective_token and "HF_TOKEN" not in os.environ:
+            os.environ["HF_TOKEN"] = effective_token
 
-        # Initialize all environment variables
-        self._initialize_env_vars()
+        # Initialize all other environment variables
+        self._initialize_env_vars(force_hf_transfer_setting=effective_enable_hf_transfer)
 
         # Keep track of effective paths
+        # Recalculate HF_HUB_CACHE based on final HF_HOME
+        hf_home_final = os.environ["HF_HOME"]
+        hf_hub_cache_default = os.path.join(hf_home_final, "hub")
+        hf_hub_cache_final = os.environ.get("HF_HUB_CACHE", hf_hub_cache_default)
+        # Ensure HF_HUB_CACHE is explicitly set if it was derived
+        if "HF_HUB_CACHE" not in os.environ or not os.environ["HF_HUB_CACHE"]:
+             os.environ["HF_HUB_CACHE"] = hf_hub_cache_final
+
         self.effective_paths = {
-            "HF_HOME": os.path.expanduser(os.environ.get("HF_HOME", "~/.cache/huggingface")),
-            "HF_HUB_CACHE": os.path.expanduser(os.environ.get("HF_HUB_CACHE", os.path.join(os.environ.get("HF_HOME", "~/.cache/huggingface"), "hub"))), # Ensure default hub path is derived correctly
+            "HF_HOME": hf_home_final,
+            "HF_HUB_CACHE": hf_hub_cache_final,
             "structured_root": self.structured_root
         }
-        # Ensure HF_HUB_CACHE is explicitly set if derived, as other parts rely on it
-        if "HF_HUB_CACHE" not in os.environ or not os.environ["HF_HUB_CACHE"]:
-             os.environ["HF_HUB_CACHE"] = self.effective_paths["HF_HUB_CACHE"]
 
+        self.logger = self.logger.bind(
+             profile=profile or "Default",
+             hf_home=self.effective_paths["HF_HOME"],
+             cache=self.effective_paths["HF_HUB_CACHE"],
+             org_root=self.structured_root,
+             hf_transfer=os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
+        )
+        self.logger.info("initialized")
 
-        self.logger.info("initialized",
-                         profile=profile,
-                         structured_root=self.structured_root,
-                         hf_home=self.effective_paths["HF_HOME"])
-
-        # Initialize HF API
-        # Pass token explicitly if available, otherwise it reads from env var HF_TOKEN
-        self.api = HfApi(token=os.environ.get("HF_TOKEN"))
+        # Initialize HF API (will use HF_TOKEN from env if set)
+        self.api = HfApi(token=os.environ.get("HF_TOKEN")) # Explicitly pass None if not set
 
     def _setup_logger(self, verbose: bool, format_type: str) -> structlog.BoundLogger:
         """Set up structured logging."""
@@ -133,32 +151,38 @@ class HfHubOrganizer:
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,
             structlog.processors.StackInfoRenderer(),
-            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S"),
+            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False), # Use local time
         ]
 
         if format_type == "json":
             processors.extend([
                 structlog.processors.format_exc_info,
-                structlog.processors.JSONRenderer()
+                structlog.processors.JSONRenderer(sort_keys=True) # Sort keys for consistency
             ])
         elif format_type == "structured":
             processors.extend([
                 structlog.processors.format_exc_info,
-                structlog.dev.ConsoleRenderer() # Simple structured, less pretty
+                structlog.dev.ConsoleRenderer(colors=False) # Simple structured, no colors
             ])
         else:  # console (default)
             processors.extend([
                 structlog.dev.set_exc_info,
-                structlog.dev.ConsoleRenderer(colors=True) # Pretty console
+                structlog.dev.ConsoleRenderer(colors=True, exception_formatter=structlog.dev.plain_traceback) # Pretty console
             ])
+
+        # Filter logs based on level
+        # Use standard logging handler to respect level
+        logging.basicConfig(
+            format="%(message)s",
+            level=log_level,
+        )
 
         structlog.configure(
             processors=processors,
-            wrapper_class=structlog.make_filtering_bound_logger(log_level),
-            logger_factory=structlog.PrintLoggerFactory(),
+            logger_factory=structlog.stdlib.LoggerFactory(),
+            wrapper_class=structlog.stdlib.BoundLogger,
             cache_logger_on_first_use=True,
         )
-
         return structlog.get_logger(organizer=self.__class__.__name__)
 
     def _load_config(self) -> Dict[str, Any]:
@@ -168,22 +192,28 @@ class HfHubOrganizer:
                 with open(self.config_path, 'r') as f:
                     config = json.load(f)
                     self.logger.debug("config_loaded", path=self.config_path)
+                    # Basic validation
+                    if not isinstance(config.get("profiles"), dict):
+                        self.logger.warning("invalid_profiles_section_resetting", path=self.config_path)
+                        config["profiles"] = {}
                     return config
             except json.JSONDecodeError:
-                self.logger.warning("invalid_config_file", path=self.config_path, action="creating_default")
-                return {"profiles": {}}
+                self.logger.warning("invalid_config_file_format", path=self.config_path, action="creating_default")
             except Exception as e:
-                self.logger.error("config_load_failed", path=self.config_path, error=str(e))
-                return {"profiles": {}}
-        self.logger.debug("default_config_created", path=self.config_path)
+                self.logger.error("config_load_failed", path=self.config_path, error=str(e), action="creating_default")
+        else:
+             self.logger.debug("config_file_not_found_creating_default", path=self.config_path)
+
+        # Return default if load failed or file didn't exist
         return {"profiles": {}}
+
 
     def _save_config(self):
         """Save current config to disk."""
         try:
             with open(self.config_path, 'w') as f:
-                json.dump(self.config, f, indent=2)
-                self.logger.debug("config_saved", path=self.config_path)
+                json.dump(self.config, f, indent=2, sort_keys=True)
+            self.logger.debug("config_saved", path=self.config_path)
         except Exception as e:
             self.logger.error("config_save_failed", path=self.config_path, error=str(e))
 
@@ -197,6 +227,7 @@ class HfHubOrganizer:
         base_path: Optional[str] = None,
         structured_root: Optional[str] = None,
         token: Optional[str] = None,
+        enable_hf_transfer: Optional[bool] = None,
         description: Optional[str] = None
     ):
         """Add or update a profile."""
@@ -208,10 +239,11 @@ class HfHubOrganizer:
             "base_path": os.path.expanduser(base_path) if base_path else None,
             "structured_root": os.path.expanduser(structured_root) if structured_root else None,
             "token": token, # Keep token as is (might be None)
+            "enable_hf_transfer": enable_hf_transfer, # Store the boolean or None
             "description": description or f"Profile created for {name}"
         }
 
-        # Remove None values so they don't override defaults unnecessarily
+        # Remove None values so they don't override defaults unnecessarily when loading
         profile_data = {k: v for k, v in profile_data.items() if v is not None}
 
         self.config["profiles"][name] = profile_data
@@ -227,76 +259,72 @@ class HfHubOrganizer:
         else:
             self.logger.warning("profile_not_found_for_removal", name=name)
 
-    def _initialize_env_vars(self):
+    def _initialize_env_vars(self, force_hf_transfer_setting: Optional[bool] = None):
         """Initialize environment variables with defaults if not already set."""
         # Process string environment variables
         for key, default_value in self.ENV_VARS.items():
             if key not in os.environ and default_value is not None:
-                # Handle variable expansion in default values like ${HF_HOME}
-                expanded_value = default_value
-                # Simple expansion loop (might need more robust solution for complex cases)
-                for _ in range(3): # Limit expansion depth
-                    updated = False
-                    # Use current os.environ for expansion lookup
-                    env_dict = os.environ
-                    # Temporarily add HF_HOME if it's being defined based on ~
-                    if key == "HF_HOME" and "~" in default_value:
-                         env_dict = {**os.environ, "HF_HOME": os.path.expanduser(default_value)}
-
-                    for var_name, var_value in env_dict.items():
-                        placeholder = "${" + var_name + "}"
-                        if placeholder in expanded_value:
-                            expanded_value = expanded_value.replace(placeholder, var_value)
-                            updated = True
-                    if not updated:
-                        break # No more placeholders found
+                # Handle variable expansion like ${HF_HOME}
+                # Use current os.environ for expansion lookup
+                env_dict = os.environ
+                expanded_value = os.path.expandvars(default_value.replace("${HF_HOME}", env_dict.get("HF_HOME", "")))
 
                 # Expand user path ~
                 final_value = os.path.expanduser(expanded_value)
                 os.environ[key] = final_value
-                self.logger.debug("env_var_set_default", key=key, value=final_value)
+                # Avoid logging token if it's the default None
+                if key != "HF_TOKEN" or final_value is not None:
+                     self.logger.debug("env_var_set_default_string", key=key, value=final_value)
 
         # Process boolean environment variables
         for key, default_value in self.BOOLEAN_ENV_VARS.items():
-            if key not in os.environ:
-                os.environ[key] = "1" if default_value else "0"
-                self.logger.debug("env_var_set_default_bool", key=key, value=os.environ[key])
+             # Special handling for HF_HUB_ENABLE_HF_TRANSFER based on forced setting
+             if key == "HF_HUB_ENABLE_HF_TRANSFER" and force_hf_transfer_setting is not None:
+                  current_value = "1" if force_hf_transfer_setting else "0"
+                  if os.environ.get(key) != current_value:
+                       os.environ[key] = current_value
+                       self.logger.debug("env_var_forced_bool", key=key, value=current_value)
+             elif key not in os.environ:
+                  os.environ[key] = "1" if default_value else "0"
+                  self.logger.debug("env_var_set_default_bool", key=key, value=os.environ[key])
+
 
     def _determine_category_and_paths(self, repo_id: str, category: Optional[str] = None, subfolder: Optional[str] = None) -> Tuple[str, str, str, str]:
         """Determine the category and create the organized path structure."""
         repo_type_guess = "model" # Default guess
+        namespace = "library" # Default namespace
+        repo_name = repo_id
+
+        if "/" in repo_id:
+            namespace, repo_name = repo_id.split("/", 1)
+
         if category is None:
-            if "/" in repo_id:
-                namespace, repo_name = repo_id.split("/", 1)
-                try:
-                    # Use api.repo_type() which is the correct method
-                    repo_type = self.api.repo_type(repo_id=repo_id)
-                    if repo_type == "dataset":
-                        repo_type_guess = "datasets"
-                    elif repo_type == "space":
-                        repo_type_guess = "spaces"
-                    else:
-                        repo_type_guess = "models" # Explicitly models
-                    self.logger.debug("category_detected_via_api", repo_id=repo_id, category=repo_type_guess)
-                except RepositoryNotFoundError:
-                     self.logger.error("repo_not_found_api", repo_id=repo_id)
-                     raise # Re-raise the specific error
-                except Exception as e:
-                    # Log the actual error here for better debugging
-                    self.logger.warning("category_detection_failed_api", repo_id=repo_id, error=str(e), error_type=type(e).__name__, fallback=repo_type_guess)
-            else:
-                # Assume it's a model under the implicit 'library' or 'huggingface' namespace
-                namespace = "library" # Or choose another default namespace
-                repo_name = repo_id
-                repo_type_guess = "models"
+            try:
+                # Use api.repo_info which returns repo_type correctly
+                repo_info = self.api.repo_info(repo_id=repo_id)
+                repo_type_from_api = repo_info.repo_type
+                if repo_type_from_api == "dataset":
+                    repo_type_guess = "datasets"
+                elif repo_type_from_api == "space":
+                    repo_type_guess = "spaces"
+                else:
+                    repo_type_guess = "models" # Explicitly models
+                self.logger.debug("category_detected_via_api", repo_id=repo_id, category=repo_type_guess)
+            except RepositoryNotFoundError:
+                 self.logger.error("repo_not_found_api", repo_id=repo_id)
+                 raise # Re-raise the specific error
+            except HfHubHTTPError as http_err:
+                 # Handle potential auth errors more specifically
+                 if http_err.response.status_code == 401:
+                      self.logger.error("authentication_error_api", repo_id=repo_id, error=str(http_err))
+                      raise ValueError(f"Authentication failed for {repo_id}. Check your HF_TOKEN.") from http_err
+                 else:
+                      self.logger.warning("category_detection_http_error", repo_id=repo_id, status=http_err.response.status_code, error=str(http_err), fallback=repo_type_guess)
+            except Exception as e:
+                self.logger.warning("category_detection_failed_api", repo_id=repo_id, error=str(e), error_type=type(e).__name__, fallback=repo_type_guess)
         else:
             # User provided category overrides detection
             repo_type_guess = category
-            if "/" in repo_id:
-                namespace, repo_name = repo_id.split("/", 1)
-            else:
-                namespace = "library"
-                repo_name = repo_id
 
         # Create organized base path for the repo
         org_repo_path = os.path.join(
@@ -312,35 +340,64 @@ class HfHubOrganizer:
         os.makedirs(org_download_path, exist_ok=True)
         self.logger.debug("organizing_files_target", path=org_download_path)
 
-        return org_repo_path, org_download_path, repo_type_guess, namespace # Return namespace too
+        return org_repo_path, org_download_path, repo_type_guess, namespace
 
     def _link_or_copy(self, cache_path: str, org_path: str, symlink_to_cache: bool):
         """Helper to symlink or copy a file/directory."""
+        # Ensure parent directory exists
+        org_dir = os.path.dirname(org_path)
+        if not os.path.exists(org_dir):
+             os.makedirs(org_dir, exist_ok=True)
+             self.logger.debug("created_parent_dir", path=org_dir)
+
+
+        # Handle existing target path
         if os.path.lexists(org_path): # Use lexists to check for broken symlinks too
-            if os.path.islink(org_path) or os.path.isfile(org_path):
-                os.remove(org_path)
-                self.logger.debug("removed_existing_target", path=org_path)
-            elif os.path.isdir(org_path):
-                 # Ensure we are not removing the cache path itself if symlinking fails
-                 # Use realpath to resolve symlinks before comparison
+            is_link = os.path.islink(org_path)
+            is_dir = os.path.isdir(org_path) and not is_link # Real directory
+            is_file = os.path.isfile(org_path) and not is_link # Real file
+
+            # Decide if removal is needed
+            remove_existing = True
+            if is_link:
                  try:
-                      if not os.path.samefile(os.path.realpath(org_path), os.path.realpath(cache_path)):
-                          shutil.rmtree(org_path)
-                          self.logger.debug("removed_existing_target_dir", path=org_path)
-                      else:
-                          self.logger.warning("skipping_removal_target_is_cache", path=org_path)
-                 except FileNotFoundError:
-                      # If realpath fails (e.g., broken link target), safe to remove the link/dir itself
-                      shutil.rmtree(org_path)
-                      self.logger.debug("removed_existing_broken_link_or_dir", path=org_path)
-                 except OSError as e:
-                      self.logger.error("error_comparing_paths_before_removal", org_path=org_path, cache_path=cache_path, error=str(e))
-                      # Decide whether to proceed with removal or raise error - safer to skip removal
-                      self.logger.warning("skipping_removal_due_to_path_comparison_error", path=org_path)
+                      link_target = os.readlink(org_path)
+                      # Don't remove if it's already linked to the correct cache path
+                      if link_target == os.path.abspath(cache_path):
+                           self.logger.debug("target_already_correct_symlink", path=org_path)
+                           remove_existing = False
+                 except OSError: # Broken link
+                      pass # Remove broken link
+            elif is_dir and not symlink_to_cache:
+                 # If copying a directory, remove existing dir first
+                 pass
+            elif is_file and not symlink_to_cache:
+                 # If copying a file, remove existing file first
+                 pass
+            elif is_dir and symlink_to_cache:
+                 # Trying to symlink where a directory exists - remove dir
+                 pass
+            elif is_file and symlink_to_cache:
+                 # Trying to symlink where a file exists - remove file
+                 pass
+            else: # Other cases?
+                 self.logger.warning("unhandled_existing_target_state", path=org_path, is_link=is_link, is_dir=is_dir, is_file=is_file)
+                 remove_existing = False # Be safe
+
+            if remove_existing:
+                try:
+                    if is_link or is_file:
+                        os.remove(org_path)
+                        self.logger.debug("removed_existing_target_link_or_file", path=org_path)
+                    elif is_dir:
+                        shutil.rmtree(org_path)
+                        self.logger.debug("removed_existing_target_dir", path=org_path)
+                except OSError as e:
+                    self.logger.error("failed_removing_existing_target", path=org_path, error=str(e))
+                    raise # Stop if we can't prepare the target location
 
 
-        os.makedirs(os.path.dirname(org_path), exist_ok=True) # Ensure parent exists
-
+        # Create link or copy
         if symlink_to_cache:
             try:
                 # Ensure cache_path is absolute for reliable symlinking
@@ -349,20 +406,21 @@ class HfHubOrganizer:
                 self.logger.debug("symlink_created", source=abs_cache_path, target=org_path)
             except OSError as e:
                  self.logger.error("symlink_failed", source=cache_path, target=org_path, error=str(e))
-                 # Fallback or raise? For now, log error.
                  raise # Let the error propagate
         else:
             try:
                 if os.path.isdir(cache_path):
                     shutil.copytree(cache_path, org_path, symlinks=True) # Preserve symlinks within copied structure if any
                     self.logger.debug("directory_copied", source=cache_path, target=org_path)
-                else:
+                elif os.path.isfile(cache_path):
                     shutil.copy2(cache_path, org_path) # copy2 preserves metadata
                     self.logger.debug("file_copied", source=cache_path, target=org_path)
+                else:
+                    self.logger.warning("copy_source_not_found_or_not_file_or_dir", source=cache_path)
+
             except Exception as e:
                 self.logger.error("copy_failed", source=cache_path, target=org_path, error=str(e))
                 raise # Let the error propagate
-
 
     def download(
         self,
@@ -372,27 +430,33 @@ class HfHubOrganizer:
         revision: Optional[str] = None,
         category: Optional[str] = None,
         symlink_to_cache: bool = True,
-        **kwargs # Pass extra args like allow_patterns to underlying functions
+        allow_patterns: Optional[List[str]] = None,
+        ignore_patterns: Optional[List[str]] = None,
+        **kwargs # Pass extra args like force_download
     ) -> str:
         """
         Download a full repository or a specific file and organize it.
+        Uses snapshot_download or hf_hub_download from huggingface_hub.
         """
         start_time = time.time()
-        self.logger.info("download_started", repo_id=repo_id, filename=filename or "entire_repo", subfolder=subfolder)
+        log_ctx = {"repo_id": repo_id, "filename": filename or "entire_repo", "subfolder": subfolder, "revision": revision or "main"}
+        self.logger.info("download_started", **log_ctx)
 
         try:
             org_repo_path, org_download_path, detected_category, _ = self._determine_category_and_paths(
                 repo_id, category, subfolder
             )
+            log_ctx["category"] = detected_category
 
             # Save metadata about this download attempt (even if it fails later)
-            self._save_download_metadata(org_repo_path, repo_id, detected_category, filename or "entire_repo", subfolder)
+            self._save_download_metadata(org_repo_path, repo_id, detected_category, filename or "entire_repo", subfolder, revision)
 
             downloaded_path_in_cache: str
             final_organized_path: str
 
             if filename:
                 # --- Download a specific file ---
+                self.logger.debug("downloading_single_file", **log_ctx)
                 downloaded_path_in_cache = hf_hub_download(
                     repo_id=repo_id,
                     filename=filename,
@@ -408,76 +472,70 @@ class HfHubOrganizer:
 
             else:
                 # --- Download entire repo (or subfolder) ---
+                self.logger.debug("downloading_snapshot", allow_patterns=allow_patterns, ignore_patterns=ignore_patterns, **log_ctx)
                 downloaded_path_in_cache = snapshot_download(
                     repo_id=repo_id,
                     subfolder=subfolder,
                     revision=revision,
                     repo_type=detected_category if detected_category in ["models", "datasets", "spaces"] else None,
+                    allow_patterns=allow_patterns,
+                    ignore_patterns=ignore_patterns,
                     token=self.api.token, # Pass token
                     **kwargs
                 )
                 # Target path is the directory itself
                 final_organized_path = org_download_path
-                # snapshot_download returns the path to the *root* of the snapshot,
-                # even if a subfolder was requested. We need to handle linking/copying
-                # the contents correctly into the target org_download_path.
 
-                # Remove existing target dir before linking/copying contents
-                if os.path.lexists(final_organized_path): # Use lexists for symlinks
+                # Ensure target directory exists and is empty/correctly linked
+                if os.path.lexists(final_organized_path):
                     if os.path.islink(final_organized_path):
+                        # If it's a link, remove it to copy/link contents
                         os.remove(final_organized_path)
                     elif os.path.isdir(final_organized_path):
-                         # Check if it points to the cache before removing
-                         try:
-                              if not os.path.samefile(os.path.realpath(final_organized_path), os.path.realpath(downloaded_path_in_cache)):
-                                  shutil.rmtree(final_organized_path)
-                                  self.logger.debug("removed_existing_target_dir_for_snapshot", path=final_organized_path)
-                              else:
-                                   self.logger.warning("skipping_removal_snapshot_target_is_cache", path=final_organized_path)
-                         except FileNotFoundError:
-                              shutil.rmtree(final_organized_path) # Remove broken link/dir
-                              self.logger.debug("removed_existing_broken_link_or_dir_snapshot", path=final_organized_path)
-                         except OSError as e:
-                              self.logger.error("error_comparing_paths_snapshot", org_path=final_organized_path, cache_path=downloaded_path_in_cache, error=str(e))
-                              self.logger.warning("skipping_removal_due_to_path_comparison_error_snapshot", path=final_organized_path)
-
-
+                         # If it's a directory, remove its contents before populating
+                         for item in os.listdir(final_organized_path):
+                              item_path = os.path.join(final_organized_path, item)
+                              if os.path.islink(item_path) or os.path.isfile(item_path):
+                                   os.remove(item_path)
+                              elif os.path.isdir(item_path):
+                                   shutil.rmtree(item_path)
+                         self.logger.debug("cleared_existing_target_dir_contents", path=final_organized_path)
                     else: # It's a file? Remove it.
                          os.remove(final_organized_path)
-
-                os.makedirs(final_organized_path, exist_ok=True)
+                else:
+                     # If it doesn't exist, create it
+                     os.makedirs(final_organized_path, exist_ok=True)
 
 
                 # Link or copy contents item by item
                 item_count = 0
-                for item_name in os.listdir(downloaded_path_in_cache):
+                items_in_cache = os.listdir(downloaded_path_in_cache)
+                for item_name in items_in_cache:
                     cache_item_path = os.path.join(downloaded_path_in_cache, item_name)
                     org_item_path = os.path.join(final_organized_path, item_name)
                     self._link_or_copy(cache_item_path, org_item_path, symlink_to_cache)
                     item_count += 1
-                self.logger.debug("snapshot_contents_processed", count=item_count, source=downloaded_path_in_cache, target=final_organized_path)
+                self.logger.debug("snapshot_contents_processed", count=item_count, source=downloaded_path_in_cache, target=final_organized_path, items=len(items_in_cache))
 
 
             elapsed = time.time() - start_time
             self.logger.info("download_completed",
-                            repo_id=repo_id,
                             organized_path=final_organized_path,
                             elapsed_seconds=round(elapsed, 2),
-                            profile=self.selected_profile)
+                            symlinked=symlink_to_cache,
+                            **log_ctx)
 
             return final_organized_path
 
         except RepositoryNotFoundError:
-             self.logger.error("download_failed_repo_not_found", repo_id=repo_id)
+             self.logger.error("download_failed_repo_not_found", **log_ctx)
              raise # Re-raise for CLI handling
+        except HfHubHTTPError as http_err:
+             self.logger.error("download_failed_http_error", status=http_err.response.status_code, error=str(http_err), **log_ctx)
+             raise
         except Exception as e:
-            self.logger.error("download_failed",
-                             repo_id=repo_id,
-                             filename=filename,
-                             error=str(e),
-                             error_type=type(e).__name__)
+            self.logger.exception("download_failed_unexpected", error=str(e), **log_ctx) # Use exception for traceback
             raise # Re-raise for CLI handling
-
 
     def download_recent(
         self,
@@ -487,75 +545,101 @@ class HfHubOrganizer:
         revision: Optional[str] = None,
         category: Optional[str] = None,
         symlink_to_cache: bool = True,
-        **kwargs # Pass extra args like allow_patterns to underlying functions
+        allow_patterns: Optional[List[str]] = None,
+        ignore_patterns: Optional[List[str]] = None,
+        **kwargs # Pass extra args like force_download
     ) -> str:
         """
         Download only files modified within the last N days for a repository.
-        Assumes repo_id has already been validated against exclusion patterns by the caller (main).
+        Uses list_repo_files_info and hf_hub_download.
         """
         start_time = time.time()
-        self.logger.info("download_recent_started", repo_id=repo_id, days_ago=days_ago, subfolder=subfolder)
+        log_ctx = {"repo_id": repo_id, "days_ago": days_ago, "subfolder": subfolder, "revision": revision or "main"}
+        self.logger.info("download_recent_started", **log_ctx)
 
         try:
             # Determine target paths and category
             org_repo_path, org_download_path, detected_category, _ = self._determine_category_and_paths(
-                repo_id, category, subfolder # Files will land relative to this path
+                repo_id, category, subfolder
             )
+            log_ctx["category"] = detected_category
 
             # Calculate the cutoff date (make it timezone-aware UTC)
             cutoff_date = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days_ago)
-            self.logger.debug("filtering_commits_since", cutoff_date=cutoff_date.isoformat())
+            self.logger.debug("filtering_commits_since", cutoff_date=cutoff_date.isoformat(), **log_ctx)
 
             # Get file info including commit details
             # Use token explicitly if needed, otherwise API client uses env var
-            # --- This call should now work because list_repo_files_info is imported ---
-            all_files_info: List[RepoFile] = list_repo_files(
+            all_files_info: List[RepoFile] = list_repo_files_info( # <--- FIXED: Use list_repo_files_info
                 repo_id=repo_id,
                 revision=revision,
-                # repo_type=detected_category if detected_category in ["models", "datasets", "spaces"] else None, # repo_type not needed here
                 token=self.api.token # Pass token from initialized API client
             )
+            self.logger.debug("retrieved_repo_file_info", count=len(all_files_info), **log_ctx)
 
-            # Filter files based on last commit date
+
+            # Filter files based on last commit date AND patterns
             recent_files_to_download: List[RepoFile] = []
             for file_info in all_files_info:
-                # Ensure commit info and date exist, and compare with cutoff
+                # 1. Check commit date
+                is_recent = False
                 if file_info.last_commit and file_info.last_commit.date and file_info.last_commit.date > cutoff_date:
-                     # Check if the file is within the requested subfolder (if specified)
-                     if subfolder:
-                         # file_info.path is relative to repo root
-                         # Ensure consistent trailing slash handling for comparison
-                         norm_subfolder = subfolder.strip('/')
-                         # Check if path starts with subfolder/ or is exactly subfolder (if it's a file)
-                         if file_info.path == norm_subfolder or file_info.path.startswith(norm_subfolder + '/'):
-                             recent_files_to_download.append(file_info)
-                             self.logger.debug("found_recent_file_in_subfolder", file=file_info.path, commit_date=file_info.last_commit.date)
-                     else:
-                         # No subfolder specified, include all recent files
-                         recent_files_to_download.append(file_info)
-                         self.logger.debug("found_recent_file", file=file_info.path, commit_date=file_info.last_commit.date)
+                    is_recent = True
+
+                if not is_recent:
+                    continue # Skip if not recent
+
+                # 2. Check subfolder
+                in_subfolder = True # Assume yes if no subfolder specified
+                if subfolder:
+                    norm_subfolder = subfolder.strip('/')
+                    # Check if path starts with subfolder/ or is exactly subfolder
+                    if not (file_info.path == norm_subfolder or file_info.path.startswith(norm_subfolder + '/')):
+                         in_subfolder = False
+
+                if not in_subfolder:
+                     continue # Skip if not in requested subfolder
+
+
+                # 3. Check allow/ignore patterns
+                path_matches = True # Assume match unless excluded
+                if allow_patterns:
+                     path_matches = any(fnmatch.fnmatch(file_info.path, pattern) for pattern in allow_patterns)
+                if path_matches and ignore_patterns: # Only check ignore if it wasn't excluded by allow
+                     if any(fnmatch.fnmatch(file_info.path, pattern) for pattern in ignore_patterns):
+                          path_matches = False
+
+                if not path_matches:
+                     self.logger.debug("file_skipped_by_pattern", file=file_info.path, **log_ctx)
+                     continue # Skip if excluded by patterns
+
+                # If all checks pass, add to list
+                recent_files_to_download.append(file_info)
+                self.logger.debug("file_marked_for_recent_download", file=file_info.path, commit_date=file_info.last_commit.date, **log_ctx)
+
 
             if not recent_files_to_download:
-                self.logger.info("no_recent_files_found", repo_id=repo_id, days_ago=days_ago, subfolder=subfolder)
+                self.logger.info("no_recent_files_found_matching_criteria", **log_ctx)
                 # Still save metadata indicating an attempt was made
-                self._save_download_metadata(org_repo_path, repo_id, detected_category, f"recent_{days_ago}d", subfolder)
+                self._save_download_metadata(org_repo_path, repo_id, detected_category, f"recent_{days_ago}d", subfolder, revision)
                 return org_download_path # Return the base path even if nothing downloaded
 
-            self.logger.info("downloading_recent_files", count=len(recent_files_to_download))
+            self.logger.info("downloading_recent_files", count=len(recent_files_to_download), **log_ctx)
 
             # Download each recent file individually
             downloaded_count = 0
+            failed_count = 0
             for file_info in recent_files_to_download:
                 try:
                     # Determine the correct subfolder relative to the repo root for hf_hub_download
                     file_repo_subfolder = os.path.dirname(file_info.path)
                     file_basename = os.path.basename(file_info.path)
 
-                    self.logger.debug("downloading_individual_recent_file", file=file_info.path)
+                    self.logger.debug("downloading_individual_recent_file", file=file_info.path, **log_ctx)
                     downloaded_path_in_cache = hf_hub_download(
                         repo_id=repo_id,
-                        filename=file_basename, # Just the filename
-                        subfolder=file_repo_subfolder if file_repo_subfolder else None, # Subfolder relative to repo root
+                        filename=file_basename,
+                        subfolder=file_repo_subfolder if file_repo_subfolder else None,
                         revision=revision, # Use specific revision if needed
                         repo_type=detected_category if detected_category in ["models", "datasets", "spaces"] else None,
                         token=self.api.token, # Pass token
@@ -563,17 +647,14 @@ class HfHubOrganizer:
                     )
 
                     # Determine the final organized path for this specific file
-                    # It should mirror the structure within the repo, relative to org_download_path
                     relative_file_path = file_info.path # Path relative to repo root
                     if subfolder:
                          # Adjust relative path if user requested a subfolder download
                          norm_subfolder = subfolder.strip('/')
                          if file_info.path.startswith(norm_subfolder + '/'):
                              relative_file_path = os.path.relpath(file_info.path, norm_subfolder)
-                         # Handle case where the file itself is the subfolder target (unlikely but possible)
                          elif file_info.path == norm_subfolder:
                               relative_file_path = os.path.basename(file_info.path)
-
 
                     final_organized_path = os.path.join(org_download_path, relative_file_path)
 
@@ -582,73 +663,67 @@ class HfHubOrganizer:
                     downloaded_count += 1
 
                 except Exception as e_file:
-                    self.logger.error("failed_downloading_recent_file", file=file_info.path, error=str(e_file))
-                    # Continue with other files? Or stop? For now, continue.
+                    failed_count += 1
+                    self.logger.error("failed_downloading_recent_file", file=file_info.path, error=str(e_file), **log_ctx)
+                    # Continue with other files
 
             elapsed = time.time() - start_time
             self.logger.info("download_recent_completed",
-                            repo_id=repo_id,
                             files_downloaded=downloaded_count,
+                            files_failed=failed_count,
                             target_path=org_download_path,
                             elapsed_seconds=round(elapsed, 2),
-                            profile=self.selected_profile)
+                            symlinked=symlink_to_cache,
+                            **log_ctx)
 
             # Save metadata indicating a successful recent download
-            self._save_download_metadata(org_repo_path, repo_id, detected_category, f"recent_{days_ago}d", subfolder)
+            self._save_download_metadata(org_repo_path, repo_id, detected_category, f"recent_{days_ago}d", subfolder, revision)
 
             return org_download_path # Return the base path where files were placed
 
         except RepositoryNotFoundError:
-             # This exception should now be defined
-             self.logger.error("download_failed_repo_not_found", repo_id=repo_id)
+             self.logger.error("download_failed_repo_not_found", **log_ctx)
+             raise
+        except HfHubHTTPError as http_err:
+             self.logger.error("download_recent_failed_http_error", status=http_err.response.status_code, error=str(http_err), **log_ctx)
              raise
         except Exception as e:
-            self.logger.error("download_recent_failed",
-                             repo_id=repo_id,
-                             error=str(e),
-                             error_type=type(e).__name__)
+            self.logger.exception("download_recent_failed_unexpected", error=str(e), **log_ctx)
             raise
 
-    def _save_download_metadata(self, path: str, repo_id: str, category: str, filename: Optional[str] = None, subfolder: Optional[str] = None):
+    def _save_download_metadata(self, path: str, repo_id: str, category: str, download_type: str, subfolder: Optional[str] = None, revision: Optional[str] = None):
         """Save metadata about downloaded repo/file for future reference."""
-        # Use metadata dir within the *selected profile's* structured root
         metadata_dir = os.path.join(self.structured_root, ".metadata")
         os.makedirs(metadata_dir, exist_ok=True)
         metadata_file = os.path.join(metadata_dir, "downloads.json")
 
-        # Load existing metadata
         metadata = {"downloads": []}
         if os.path.exists(metadata_file):
             try:
                 with open(metadata_file, 'r') as f:
-                    metadata = json.load(f)
-                    if not isinstance(metadata.get("downloads"), list):
+                    loaded_data = json.load(f)
+                    if isinstance(loaded_data, dict) and isinstance(loaded_data.get("downloads"), list):
+                         metadata = loaded_data
+                    else:
                          self.logger.warning("invalid_metadata_format_resetting", path=metadata_file)
-                         metadata = {"downloads": []}
             except json.JSONDecodeError:
                  self.logger.warning("invalid_metadata_file_resetting", path=metadata_file)
-                 metadata = {"downloads": []}
             except Exception as e:
                  self.logger.error("failed_loading_metadata", path=metadata_file, error=str(e))
-                 # Proceed with empty metadata to avoid losing new entry
-                 metadata = {"downloads": []}
 
-
-        # Add new entry
         entry = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "repo_id": repo_id,
             "category": category,
-            # Store path relative to the structured root for portability
+            "type": download_type, # e.g., "entire_repo", "filename.txt", "recent_7d"
             "relative_path": os.path.relpath(path, self.structured_root),
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "profile": self.selected_profile, # Record which profile was used
+            "profile": self.selected_profile,
+            "revision": revision or "main",
+            "subfolder": subfolder,
         }
-        if filename: # Can be "entire_repo", specific file, or "recent_Xd"
-            entry["type"] = filename
-        if subfolder:
-            entry["subfolder"] = subfolder
+        # Remove None values for cleaner output
+        entry = {k: v for k, v in entry.items() if v is not None}
 
-        # Prepend new entry (most recent first)
         metadata["downloads"].insert(0, entry)
 
         # Optional: Limit history size
@@ -656,18 +731,15 @@ class HfHubOrganizer:
         if len(metadata["downloads"]) > max_history:
              metadata["downloads"] = metadata["downloads"][:max_history]
 
-        # Save updated metadata
         try:
             with open(metadata_file, 'w') as f:
-                json.dump(metadata, f, indent=2)
+                json.dump(metadata, f, indent=2, sort_keys=True)
         except Exception as e:
              self.logger.error("failed_saving_metadata", path=metadata_file, error=str(e))
 
 
     def list_downloads(self, limit: Optional[int] = None, category: Optional[str] = None, profile_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-        """List download history with filtering options."""
-        # Use metadata dir within the *selected profile's* structured root
-        # Or should it list across all profiles? Let's assume current profile for now.
+        """List download history recorded by this tool."""
         metadata_file = os.path.join(self.structured_root, ".metadata", "downloads.json")
 
         if not os.path.exists(metadata_file):
@@ -682,17 +754,19 @@ class HfHubOrganizer:
              return []
 
         downloads = metadata.get("downloads", [])
+        if not isinstance(downloads, list):
+             self.logger.error("invalid_metadata_structure_downloads_not_list", path=metadata_file)
+             return []
+
 
         # Apply filters
         filtered_downloads = downloads
         if category:
-            filtered_downloads = [d for d in filtered_downloads if d.get("category") == category]
+            filtered_downloads = [d for d in filtered_downloads if isinstance(d, dict) and d.get("category") == category]
         if profile_filter:
-             # Filter by the profile recorded in the metadata entry
-             filtered_downloads = [d for d in filtered_downloads if d.get("profile") == profile_filter]
+             filtered_downloads = [d for d in filtered_downloads if isinstance(d, dict) and d.get("profile") == profile_filter]
 
-
-        # Apply limit (already sorted newest first due to insertion order)
+        # Apply limit
         if limit and limit > 0:
             filtered_downloads = filtered_downloads[:limit]
 
@@ -700,143 +774,71 @@ class HfHubOrganizer:
 
     def scan_cache(self) -> List[Dict[str, Any]]:
         """
-        Scan the HF cache directory associated with the current profile/HF_HOME.
-        Provides a summary per repo/revision found in the cache.
-        Note: This is a filesystem scan and might not perfectly match HF internal state.
+        Scan the HF cache directory using huggingface_hub.scan_cache_dir.
         """
-        # Use the effective cache path based on initialized env vars
         cache_dir = self.effective_paths["HF_HUB_CACHE"]
-
-        if not os.path.exists(cache_dir):
-            self.logger.warning("cache_dir_not_found", path=cache_dir)
-            return []
-
-        self.logger.info("scanning_cache", path=cache_dir)
-        scan_results = []
-        processed_dirs = set() # Avoid double counting if symlinks exist within cache
+        self.logger.info("scanning_cache_with_hf_hub", path=cache_dir)
 
         try:
-            # Walk the cache directory
-            for root, dirs, files in os.walk(cache_dir, topdown=True):
-                # Skip directories we know are internal or irrelevant
-                dirs[:] = [d for d in dirs if d not in ['.locks', '.temp']] # Modify dirs in place
+            scan = scan_cache_dir(cache_dir)
+            self.logger.info("cache_scan_complete", repos=scan.repos_count, size=scan.size_on_disk_str)
 
-                # Check if current root looks like a repo snapshot directory
-                # Example: .../hub/models--google--flan-t5-base/snapshots/abcdef12345...
-                # Example: .../hub/datasets--squad/snapshots/abcdef12345...
-                path_parts = Path(root).parts
-                if len(path_parts) > 2 and path_parts[-2] == 'snapshots':
-                    snapshot_hash = path_parts[-1]
-                    repo_dir_name = path_parts[-3] # e.g., models--google--flan-t5-base
-
-                    # Prevent processing the same snapshot dir multiple times if traversed via symlink
-                    try:
-                        real_path = os.path.realpath(root)
-                        if real_path in processed_dirs:
-                            continue
-                        processed_dirs.add(real_path)
-                    except OSError: # Handle cases where realpath might fail (e.g., broken links)
-                        self.logger.warning("realpath_failed_skipping_dir", path=root)
-                        continue
-
-
-                    # Decode repo_id and type
-                    repo_type = "unknown"
-                    repo_id = repo_dir_name # Default if no type prefix
-                    if repo_dir_name.startswith("models--"):
-                        repo_type = "model"
-                        repo_id = repo_dir_name[len("models--"):].replace("--", "/", 1)
-                    elif repo_dir_name.startswith("datasets--"):
-                        repo_type = "dataset"
-                        repo_id = repo_dir_name[len("datasets--"):].replace("--", "/", 1)
-                    elif repo_dir_name.startswith("spaces--"):
-                        repo_type = "space"
-                        repo_id = repo_dir_name[len("spaces--"):].replace("--", "/", 1)
-
-                    # Calculate size and file count for this specific snapshot directory
-                    dir_size = 0
-                    file_count = 0
-                    largest_file = {"name": "", "size": 0}
-                    try:
-                        for item in os.listdir(root):
-                            item_path = os.path.join(root, item)
-                            # Important: Check if it's a file and *not* a symlink pointing outside?
-                            # For size calculation, follow symlinks *within* the snapshot? Let's not follow for simplicity.
-                            if os.path.isfile(item_path) and not os.path.islink(item_path):
+            results = []
+            for repo_info in scan.repos:
+                 for revision_info in repo_info.revisions:
+                      # Find largest file in this specific snapshot
+                      largest_file = {"name": "", "size": 0}
+                      snapshot_path = Path(revision_info.snapshot_path)
+                      try:
+                           files_in_snapshot = [p for p in snapshot_path.rglob('*') if p.is_file()]
+                           for file_path in files_in_snapshot:
                                 try:
-                                    file_size = os.path.getsize(item_path)
-                                    dir_size += file_size
-                                    file_count += 1
-                                    if file_size > largest_file["size"]:
-                                        largest_file = {"name": item, "size": file_size}
+                                     file_size = file_path.stat().st_size
+                                     if file_size > largest_file["size"]:
+                                          largest_file = {"name": str(file_path.relative_to(snapshot_path)), "size": file_size}
                                 except OSError:
-                                    self.logger.warning("getsize_failed_file", path=item_path)
-                            elif os.path.isdir(item_path) and not os.path.islink(item_path):
-                                # Recursively calculate size of subdirectories within snapshot
-                                for sub_root, _, sub_files in os.walk(item_path):
-                                     for sub_file in sub_files:
-                                         sub_file_path = os.path.join(sub_root, sub_file)
-                                         if os.path.isfile(sub_file_path) and not os.path.islink(sub_file_path):
-                                             try:
-                                                 file_size = os.path.getsize(sub_file_path)
-                                                 dir_size += file_size
-                                                 file_count += 1
-                                                 if file_size > largest_file["size"]:
-                                                     largest_file = {"name": os.path.relpath(sub_file_path, root), "size": file_size}
-                                             except OSError:
-                                                 self.logger.warning("getsize_failed_subfile", path=sub_file_path)
-
-                    except OSError as e:
-                        self.logger.warning("cache_scan_error_accessing_dir", directory=root, error=str(e))
-                        continue # Skip this directory if not accessible
+                                     self.logger.warning("getsize_failed_cache_scan", path=str(file_path))
+                      except OSError as e:
+                           self.logger.warning("failed_listing_snapshot_files", path=str(snapshot_path), error=str(e))
 
 
-                    # Get last modified time (use dir mtime as approximation)
-                    try:
-                        last_modified_ts = os.path.getmtime(root)
-                        last_modified_dt = datetime.datetime.fromtimestamp(last_modified_ts, tz=datetime.timezone.utc)
-                    except OSError:
-                        last_modified_dt = None # Handle cases where mtime fails
-
-                    scan_results.append({
-                        "repo_id": repo_id,
-                        "repo_type": repo_type,
-                        "revision": snapshot_hash, # This is the commit hash (snapshot hash)
-                        "size_bytes": dir_size,
-                        "size_human": humanize.naturalsize(dir_size),
-                        "file_count": file_count,
-                        "largest_file": largest_file,
-                        "last_modified": last_modified_dt.isoformat() if last_modified_dt else None,
-                        "cache_path": root # Store the path for potential deletion
-                    })
+                      results.append({
+                          "repo_id": repo_info.repo_id,
+                          "repo_type": repo_info.repo_type,
+                          "revision": revision_info.commit_hash,
+                          "size_bytes": revision_info.size_on_disk,
+                          "size_human": revision_info.size_on_disk_str,
+                          "file_count": len(revision_info.files), # Count files directly associated with revision
+                          "largest_file": largest_file,
+                          "last_modified": revision_info.last_modified.isoformat() if revision_info.last_modified else None,
+                          "cache_path": str(revision_info.snapshot_path) # Store path for cleaning
+                      })
 
             # Sort by size (largest first)
-            scan_results.sort(key=lambda x: x["size_bytes"], reverse=True)
-            self.logger.info("cache_scan_complete", entries_found=len(scan_results))
-            return scan_results
+            results.sort(key=lambda x: x["size_bytes"], reverse=True)
+            return results
 
         except Exception as e:
-            self.logger.error("cache_scan_failed", path=cache_dir, error=str(e), error_type=type(e).__name__)
+            self.logger.exception("cache_scan_failed_hf_hub", path=cache_dir, error=str(e))
             return []
 
-
     def get_cache_stats(self) -> Dict[str, Any]:
-        """Get statistics about the cache usage based on scan results."""
-        cache_items = self.scan_cache() # Use the detailed scan
+        """Get statistics about the cache usage based on scan_cache results."""
+        cache_items = self.scan_cache() # Uses the new scan_cache
 
         if not cache_items:
             return {
                 "total_size": 0,
                 "total_size_human": "0 B",
-                "repo_count": 0, # Count unique repo_ids
-                "snapshot_count": 0, # Count individual snapshots/revisions
+                "repo_count": 0,
+                "snapshot_count": 0,
                 "file_count": 0,
                 "largest_snapshots": [],
                 "organizations": []
             }
 
         total_size = sum(item["size_bytes"] for item in cache_items)
-        total_files = sum(item["file_count"] for item in cache_items)
+        total_files = sum(item["file_count"] for item in cache_items) # Uses file_count from scan
         unique_repos = {item["repo_id"] for item in cache_items}
 
         # Get top 5 largest snapshots (revisions)
@@ -846,19 +848,14 @@ class HfHubOrganizer:
         orgs = {}
         for item in cache_items:
             repo_id = item["repo_id"]
-            # Determine organization/namespace
-            if "/" in repo_id:
-                org = repo_id.split("/")[0]
-            else:
-                org = "library" # Use 'library' for top-level models like 'gpt2'
+            org = repo_id.split("/")[0] if "/" in repo_id else "library"
 
             if org not in orgs:
                 orgs[org] = {"size_bytes": 0, "snapshot_count": 0}
 
             orgs[org]["size_bytes"] += item["size_bytes"]
-            orgs[org]["snapshot_count"] += 1 # Count each snapshot under the org
+            orgs[org]["snapshot_count"] += 1
 
-        # Calculate percentages and format sizes for organizations
         formatted_orgs = []
         for org, stats in orgs.items():
             percentage = (stats["size_bytes"] / total_size) * 100 if total_size > 0 else 0
@@ -870,7 +867,6 @@ class HfHubOrganizer:
                 "percentage": percentage
             })
 
-        # Sort organizations by size
         top_orgs = sorted(formatted_orgs, key=lambda x: x["size_bytes"], reverse=True)
 
         return {
@@ -879,54 +875,46 @@ class HfHubOrganizer:
             "repo_count": len(unique_repos),
             "snapshot_count": len(cache_items),
             "file_count": total_files,
-            "largest_snapshots": largest_snapshots, # Show largest individual snapshots
+            "largest_snapshots": largest_snapshots,
             "organizations": top_orgs
         }
 
     def clean_cache(self, older_than_days: Optional[int] = None, min_size_mb: Optional[int] = None, dry_run: bool = False) -> Tuple[int, int, List[Dict]]:
         """
         Clean up cached snapshots (revisions) based on age or size criteria.
-
-        Args:
-            older_than_days: Remove snapshots older than this many days.
-            min_size_mb: Only consider snapshots larger than this size in MB for removal criteria (removes if >=).
-            dry_run: If True, only report what would be removed.
-
-        Returns:
-            Tuple of (number of snapshots removed, bytes freed, list of removed items details).
+        Uses scan_cache() which relies on huggingface_hub.scan_cache_dir.
         """
-        cache_items = self.scan_cache() # Get detailed list including paths
+        cache_items = self.scan_cache() # Get detailed list including paths from scan_cache
         action = "dry_run" if dry_run else "clean_cache"
-        self.logger.info(f"{action}_started",
-                        older_than_days=older_than_days,
-                        min_size_mb=min_size_mb)
+        log_ctx = {"older_than_days": older_than_days, "min_size_mb": min_size_mb, "dry_run": dry_run}
+        self.logger.info(f"{action}_started", **log_ctx)
+
 
         if not cache_items:
-            self.logger.info("cache_empty")
+            self.logger.info("cache_empty", **log_ctx)
             return (0, 0, [])
 
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         freed_bytes = 0
         removed_count = 0
         removed_items_details = []
-
         items_to_remove = []
 
         # --- Filtering Logic ---
         for item in cache_items:
-            # Determine if item meets criteria for removal
             meets_age_criteria = False
             if older_than_days is not None:
                 if item["last_modified"]:
                     try:
                         last_mod_dt = datetime.datetime.fromisoformat(item["last_modified"])
+                        # Ensure it's timezone-aware (scan_cache_dir returns aware)
                         if last_mod_dt.tzinfo is None:
-                            last_mod_dt = last_mod_dt.replace(tzinfo=datetime.timezone.utc)
+                             # Should not happen with scan_cache_dir, but handle defensively
+                             last_mod_dt = last_mod_dt.replace(tzinfo=datetime.timezone.utc)
                         if (now_utc - last_mod_dt).days >= older_than_days:
                             meets_age_criteria = True
                     except ValueError:
                         self.logger.warning("invalid_date_format_for_clean", repo_id=item['repo_id'], revision=item['revision'], date_str=item["last_modified"])
-                # else: keep if no date? Or remove? Let's default to keeping if date is missing.
 
             meets_size_criteria = False
             if min_size_mb is not None:
@@ -934,21 +922,13 @@ class HfHubOrganizer:
                 if size_mb >= min_size_mb:
                     meets_size_criteria = True
 
-            # Decide whether to remove based on provided arguments
             should_remove = False
             if older_than_days is not None and min_size_mb is not None:
-                # Must meet BOTH age and size criteria
-                if meets_age_criteria and meets_size_criteria:
-                    should_remove = True
+                should_remove = meets_age_criteria and meets_size_criteria
             elif older_than_days is not None:
-                # Only age criteria given
-                if meets_age_criteria:
-                    should_remove = True
+                should_remove = meets_age_criteria
             elif min_size_mb is not None:
-                # Only size criteria given
-                if meets_size_criteria:
-                    should_remove = True
-            # If neither criteria is given, should_remove remains False
+                should_remove = meets_size_criteria
 
             if should_remove:
                 items_to_remove.append(item)
@@ -958,46 +938,57 @@ class HfHubOrganizer:
 
         # --- Execution Phase ---
         if not items_to_remove:
-             self.logger.info(f"{action}_no_items_match_criteria")
+             self.logger.info(f"{action}_no_items_match_criteria", **log_ctx)
              return (0, 0, [])
 
-        self.logger.info(f"{action}_items_to_process", count=len(items_to_remove))
+        self.logger.info(f"{action}_items_to_process", count=len(items_to_remove), **log_ctx)
 
         for item in items_to_remove:
             repo_id = item["repo_id"]
             revision = item["revision"]
             size_human = item["size_human"]
-            cache_path = item["cache_path"] # Get the specific snapshot path
+            cache_path = item["cache_path"] # Path to the snapshot directory
 
             if dry_run:
                 self.logger.info("dry_run_would_remove", repo_id=repo_id, revision=revision, size=size_human, path=cache_path)
-                removed_items_details.append(item) # Add to list for dry run report
-                freed_bytes += item["size_bytes"] # Accumulate potential freed space
+                removed_items_details.append(item)
+                freed_bytes += item["size_bytes"]
                 removed_count += 1
             else:
-                # Actually remove the directory
                 if os.path.exists(cache_path):
                     try:
                         self.logger.info("removing_snapshot", repo_id=repo_id, revision=revision, size=size_human, path=cache_path)
-                        shutil.rmtree(cache_path)
-                        # Verify removal?
-                        if not os.path.exists(cache_path):
-                             freed_bytes += item["size_bytes"]
-                             removed_count += 1
-                             removed_items_details.append(item) # Add successfully removed item
-                             self.logger.debug("removal_successful", path=cache_path)
+                        # scan_cache_dir provides CacheInfo which has a delete_revisions method
+                        # However, we scanned *all* repos. We need to delete specific revisions.
+                        # Re-scan just the target repo to get its CacheRepoInfo object
+                        repo_scan = scan_cache_dir(self.effective_paths["HF_HUB_CACHE"]).repos
+                        target_repo_info = next((r for r in repo_scan if r.repo_id == repo_id), None)
+
+                        if target_repo_info:
+                             delete_strategy = target_repo_info.delete_revisions(revision)
+                             delete_strategy.execute()
+                             if not os.path.exists(cache_path): # Verify deletion
+                                  freed_bytes += item["size_bytes"]
+                                  removed_count += 1
+                                  removed_items_details.append(item)
+                                  self.logger.debug("removal_successful", path=cache_path)
+                             else:
+                                  # This might happen if other processes hold files
+                                  self.logger.warning("removal_failed_dir_still_exists_after_delete_revisions", path=cache_path)
                         else:
-                             self.logger.warning("removal_failed_dir_still_exists", path=cache_path)
+                             self.logger.warning("could_not_find_repo_info_for_deletion", repo_id=repo_id)
+                             # Fallback to shutil.rmtree if repo info not found? Or just log?
+                             # Let's just log for now, as using the official delete is safer.
 
                     except Exception as e:
-                        self.logger.error("failed_to_remove_snapshot", repo_id=repo_id, revision=revision, path=cache_path, error=str(e))
+                        self.logger.exception("failed_to_remove_snapshot_hf_hub", repo_id=repo_id, revision=revision, path=cache_path, error=str(e))
                 else:
                     self.logger.warning("snapshot_path_not_found_for_removal", path=cache_path)
 
-
         self.logger.info(f"{action}_completed",
-                        items_processed=removed_count, # Use actual count for clean, potential for dry-run
-                        space_affected=humanize.naturalsize(freed_bytes))
+                        items_processed=removed_count,
+                        space_affected=humanize.naturalsize(freed_bytes),
+                        **log_ctx)
 
         return (removed_count, freed_bytes, removed_items_details)
 
@@ -1013,48 +1004,35 @@ class HfHubOrganizer:
         overview_data = {"total_size": 0, "categories": {}}
 
         try:
-            # Iterate through top-level directories (categories)
             for category_name in os.listdir(structured_root):
                 category_path = os.path.join(structured_root, category_name)
-                if category_name.startswith('.') or not os.path.isdir(category_path):
-                    continue # Skip hidden items and files
+                if category_name.startswith('.') or not os.path.isdir(category_path): continue
 
                 category_data = {"size_bytes": 0, "org_count": 0, "organizations": {}}
-
-                # Iterate through organizations/namespaces
                 for org_name in os.listdir(category_path):
                     org_path = os.path.join(category_path, org_name)
-                    if not os.path.isdir(org_path):
-                        continue # Skip files
+                    if not os.path.isdir(org_path): continue
 
                     org_data = {"size_bytes": 0, "repo_count": 0, "repos": []}
-
-                    # Iterate through repositories
                     for repo_name in os.listdir(org_path):
                         repo_path = os.path.join(org_path, repo_name)
-                        if not os.path.isdir(repo_path):
-                            continue # Skip files
+                        if not os.path.isdir(repo_path): continue
 
                         repo_size = 0
                         symlink_count = 0
                         file_count = 0
-
-                        # Walk through the repo directory to calculate size and count symlinks
                         try:
-                            for dirpath, dirnames, filenames in os.walk(repo_path):
+                            for dirpath, _, filenames in os.walk(repo_path, followlinks=False): # Don't follow links for size calc
                                 for filename in filenames:
                                     filepath = os.path.join(dirpath, filename)
                                     if os.path.islink(filepath):
                                         symlink_count += 1
-                                        # Optionally resolve link to check cache size? No, keep overview simple.
                                     elif os.path.isfile(filepath):
                                         try:
                                              repo_size += os.path.getsize(filepath)
                                              file_count += 1
                                         except OSError:
-                                             self.logger.warning("could_not_get_size", file=filepath)
-
-
+                                             self.logger.warning("could_not_get_size_overview", file=filepath)
                             org_data["repos"].append({
                                 "name": repo_name,
                                 "size_bytes": repo_size,
@@ -1064,24 +1042,19 @@ class HfHubOrganizer:
                                 "path": os.path.relpath(repo_path, structured_root)
                             })
                             org_data["size_bytes"] += repo_size
-
                         except OSError as walk_err:
-                            self.logger.warning("error_walking_repo_dir", path=repo_path, error=str(walk_err))
-
+                            self.logger.warning("error_walking_repo_dir_overview", path=repo_path, error=str(walk_err))
 
                     if org_data["repos"]:
                         org_data["repo_count"] = len(org_data["repos"])
                         org_data["size_human"] = humanize.naturalsize(org_data["size_bytes"])
-                        org_data["repos"].sort(key=lambda x: x["size_bytes"], reverse=True) # Sort repos by size
+                        org_data["repos"].sort(key=lambda x: x["size_bytes"], reverse=True)
                         category_data["organizations"][org_name] = org_data
                         category_data["size_bytes"] += org_data["size_bytes"]
-
 
                 if category_data["organizations"]:
                     category_data["org_count"] = len(category_data["organizations"])
                     category_data["size_human"] = humanize.naturalsize(category_data["size_bytes"])
-                    # Sort organizations by size within category?
-                    # Convert dict to list for sorting if needed later
                     overview_data["categories"][category_name] = category_data
                     overview_data["total_size"] += category_data["size_bytes"]
 
@@ -1090,8 +1063,7 @@ class HfHubOrganizer:
             return overview_data
 
         except Exception as e:
-            self.logger.error("organization_overview_failed", path=structured_root, error=str(e))
-            # Return partial data if available? Or empty? Let's return empty on error.
+            self.logger.exception("organization_overview_failed", path=structured_root, error=str(e))
             return {"total_size": 0, "total_size_human": "0 B", "categories": {}}
 
 
@@ -1103,14 +1075,17 @@ def _create_parser() -> argparse.ArgumentParser:
     """Creates the argument parser for the CLI."""
     parser = argparse.ArgumentParser(
         description="HfHubOrganizer: Manage HuggingFace Hub downloads, cache, and organization.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter # Show defaults
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--profile", help="Profile name to use (defined in config). Overrides default behavior.")
     parser.add_argument("--log-format", choices=["console", "json", "structured"],
                       default="console", help="Logging output format.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose (DEBUG level) logging.")
-    parser.add_argument("--config", default="~/.config/hf_organizer/config.json",
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH,
                         help="Path to the configuration file.")
+    parser.add_argument("--no-hf-transfer", action="store_true",
+                        help="Disable hf_transfer for downloads (if enabled by default/profile).")
+
 
     subparsers = parser.add_subparsers(dest="command", required=True, help="Command to execute")
 
@@ -1125,13 +1100,13 @@ def _create_parser() -> argparse.ArgumentParser:
     download_parser.add_argument("--base-path", help="Override HF_HOME (cache location) for this command.")
     download_parser.add_argument("--out-dir", help="Override structured organization root directory for this command.")
     download_parser.add_argument("--copy", action="store_true", help="Copy files from cache instead of symlinking.")
-    # Add allow/ignore patterns?
     download_parser.add_argument("--allow-patterns", nargs='*', help="Glob patterns to include (snapshot only).")
     download_parser.add_argument("--ignore-patterns", nargs='*', help="Glob patterns to exclude (snapshot only).")
+    download_parser.add_argument("--force-download", action="store_true", help="Force re-download even if file exists in cache.")
 
 
     # --- Download Recent Command ---
-    download_recent_parser = subparsers.add_parser("download-recent", help="Download only files modified recently.")
+    download_recent_parser = subparsers.add_parser("download-recent", help="Download only files modified recently, optionally matching patterns.")
     download_recent_parser.add_argument("repo_id", help="Repository ID (e.g., 'google/flan-t5-base')")
     download_recent_parser.add_argument("--days", "-d", type=int, required=True, help="Download files modified within the last N days.")
     download_recent_parser.add_argument("--subfolder", "-s", help="Only consider files within this subfolder.")
@@ -1141,27 +1116,23 @@ def _create_parser() -> argparse.ArgumentParser:
     download_recent_parser.add_argument("--base-path", help="Override HF_HOME (cache location).")
     download_recent_parser.add_argument("--out-dir", help="Override structured organization root directory.")
     download_recent_parser.add_argument("--copy", action="store_true", help="Copy files instead of symlinking.")
-    # --- ADDED ARGUMENT ---
+    download_recent_parser.add_argument("--allow-patterns", nargs='*', help="Glob patterns to include files.")
+    download_recent_parser.add_argument("--ignore-patterns", nargs='*', help="Glob patterns to exclude files.")
     download_recent_parser.add_argument("--exclude-repo-pattern", help="Skip download if this case-insensitive text is found in the repo_id.")
-    # --- END ADDED ARGUMENT ---
+    download_recent_parser.add_argument("--force-download", action="store_true", help="Force re-download even if file exists in cache.")
 
 
     # --- Profile Management Command ---
     profile_parser = subparsers.add_parser("profile", help="Manage configuration profiles.")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True, help="Profile action")
-
-    # List profiles
     profile_subparsers.add_parser("list", help="List available profiles.")
-
-    # Add/Update profile
     add_parser = profile_subparsers.add_parser("add", help="Add or update a profile.")
     add_parser.add_argument("name", help="Profile name.")
     add_parser.add_argument("--base-path", help="Base path for HF cache (HF_HOME). Use '~' for home dir.")
     add_parser.add_argument("--out-dir", help="Directory for organized files (structured_root). Use '~' for home dir.")
-    add_parser.add_argument("--token", help="HuggingFace API token (optional, stored in config).")
+    add_parser.add_argument("--token", help="HuggingFace API token (optional, stored encrypted/securely if possible - currently plain text).")
+    add_parser.add_argument("--enable-hf-transfer", choices=['true', 'false'], help="Enable/disable hf_transfer for this profile (overrides default).")
     add_parser.add_argument("--description", help="Short description for the profile.")
-
-    # Remove profile
     remove_parser = profile_subparsers.add_parser("remove", help="Remove a profile.")
     remove_parser.add_argument("name", help="Profile name to remove.")
 
@@ -1169,15 +1140,11 @@ def _create_parser() -> argparse.ArgumentParser:
     # --- Cache Management Command ---
     cache_parser = subparsers.add_parser("cache", help="Manage the HuggingFace Hub cache.")
     cache_subparsers = cache_parser.add_subparsers(dest="cache_command", required=True, help="Cache action")
-
-    # Scan cache
     scan_parser = cache_subparsers.add_parser("scan", help="Scan and analyze cache usage.")
     scan_parser.add_argument("--json", action="store_true", help="Output results as JSON.")
-
-    # Clean cache
     clean_parser = cache_subparsers.add_parser("clean", help="Clean up cached snapshots.")
     clean_parser.add_argument("--older-than", type=int, metavar='DAYS', help="Remove snapshots older than N days.")
-    clean_parser.add_argument("--min-size", type=int, metavar='MB', help="Remove snapshots larger than N megabytes.")
+    clean_parser.add_argument("--min-size", type=int, metavar='MB', help="Only consider snapshots >= N megabytes for removal based on other criteria.")
     clean_parser.add_argument("--dry-run", action="store_true", help="Show what would be removed without deleting.")
     clean_parser.add_argument("--json", action="store_true", help="Output removed items list as JSON (useful for dry-run).")
 
@@ -1186,8 +1153,7 @@ def _create_parser() -> argparse.ArgumentParser:
     list_downloads_parser = subparsers.add_parser("list", help="List download history recorded by this tool.")
     list_downloads_parser.add_argument("--limit", type=int, default=20, help="Limit number of results.")
     list_downloads_parser.add_argument("--category", choices=["models", "datasets", "spaces"], help="Filter by category.")
-    # Add filter by profile? The list is per-profile based on metadata location.
-    # list_downloads_parser.add_argument("--filter-profile", help="Show history only for a specific profile name.")
+    list_downloads_parser.add_argument("--filter-profile", help="Show history only for a specific profile name.")
     list_downloads_parser.add_argument("--json", action="store_true", help="Output as JSON.")
 
 
@@ -1202,33 +1168,31 @@ def main():
     parser = _create_parser()
     args = parser.parse_args()
 
-    # --- Initialize Organizer (most commands need it) ---
-    # We initialize it early to handle profile loading based on args.profile
-    # For profile commands, some args might be None initially.
+    # Determine if hf_transfer should be enabled/disabled based on flag
+    enable_hf_transfer_flag = not args.no_hf_transfer if hasattr(args, 'no_hf_transfer') else None
+
+    # --- Initialize Organizer ---
     try:
-         # Handle potential overrides from command line for specific commands
          base_path_override = getattr(args, 'base_path', None)
          out_dir_override = getattr(args, 'out_dir', None)
 
          organizer = HfHubOrganizer(
              profile=args.profile,
-             base_path=base_path_override, # Pass overrides
-             structured_root=out_dir_override, # Pass overrides
+             base_path=base_path_override,
+             structured_root=out_dir_override,
+             enable_hf_transfer=enable_hf_transfer_flag, # Pass the flag value
              verbose=args.verbose,
              config_path=args.config,
              log_format=args.log_format
          )
     except ValueError as e:
-         # Handle profile not found error during init
          print(f"Error initializing organizer: {e}")
-         # Use a basic logger if organizer setup failed
          structlog.get_logger("hfget_cli").error("init_failed", error=str(e))
          exit(1)
     except Exception as e:
          print(f"Unexpected error during initialization: {e}")
-         structlog.get_logger("hfget_cli").error("unexpected_init_failed", error=str(e), error_type=type(e).__name__)
+         structlog.get_logger("hfget_cli").exception("unexpected_init_failed", error=str(e))
          exit(1)
-
 
     # --- Execute Command ---
     try:
@@ -1237,25 +1201,35 @@ def main():
                 profiles = organizer.list_profiles()
                 if profiles:
                     print("Available profiles:")
-                    headers = ["Name", "Description", "Cache Path (HF_HOME)", "Organized Root"]
+                    headers = ["Name", "Description", "Cache Path (HF_HOME)", "Organized Root", "HF Transfer"]
                     table = []
                     for name in profiles:
                         p_config = organizer.config["profiles"].get(name, {})
                         desc = p_config.get("description", "N/A")
-                        bp = p_config.get("base_path", f"Default ({organizer.ENV_VARS['HF_HOME']})")
-                        sr = p_config.get("structured_root", f"Default ({os.path.expanduser('~/huggingface_organized')})")
-                        table.append([name, desc, bp, sr])
+                        bp = p_config.get("base_path", f"Default ({DEFAULT_HF_HOME})")
+                        sr = p_config.get("structured_root", f"Default ({DEFAULT_STRUCTURED_ROOT})")
+                        hft = p_config.get("enable_hf_transfer") # Could be True, False, or None
+                        hft_str = "Enabled" if hft is True else ("Disabled" if hft is False else f"Default ({'Enabled' if HfHubOrganizer.BOOLEAN_ENV_VARS['HF_HUB_ENABLE_HF_TRANSFER'] else 'Disabled'})")
+                        table.append([name, desc, bp, sr, hft_str])
                     print(tabulate(table, headers=headers))
                 else:
                     print("No profiles configured. Use 'profile add' to create one.")
-                    print(f"Config file location: {organizer.config_path}")
+                print(f"\nConfig file location: {organizer.config_path}")
 
             elif args.profile_command == "add":
+                # Convert enable_hf_transfer string to boolean or None
+                enable_transfer = None
+                if args.enable_hf_transfer == 'true':
+                    enable_transfer = True
+                elif args.enable_hf_transfer == 'false':
+                    enable_transfer = False
+
                 organizer.add_profile(
                     name=args.name,
                     base_path=args.base_path,
                     structured_root=args.out_dir,
                     token=args.token,
+                    enable_hf_transfer=enable_transfer,
                     description=args.description
                 )
                 print(f"Profile '{args.name}' added/updated successfully.")
@@ -1263,15 +1237,14 @@ def main():
 
             elif args.profile_command == "remove":
                 organizer.remove_profile(args.name)
-                # Confirmation message handled by logger inside method
+                print(f"Profile '{args.name}' removed (if it existed).")
+
 
         elif args.command == "download":
-             # Prepare kwargs for snapshot_download/hf_hub_download
              dl_kwargs = {}
-             if args.allow_patterns:
-                 dl_kwargs['allow_patterns'] = args.allow_patterns
-             if args.ignore_patterns:
-                 dl_kwargs['ignore_patterns'] = args.ignore_patterns
+             if args.force_download:
+                 dl_kwargs['force_download'] = True
+                 dl_kwargs['resume_download'] = False # Often used with force
 
              path = organizer.download(
                  repo_id=args.repo_id,
@@ -1280,18 +1253,22 @@ def main():
                  revision=args.revision,
                  category=args.category,
                  symlink_to_cache=not args.copy,
+                 allow_patterns=args.allow_patterns,
+                 ignore_patterns=args.ignore_patterns,
                  **dl_kwargs
              )
              print(f"\nDownload complete. Organized at: {path}")
 
         elif args.command == "download-recent":
-             # --- ADDED CHECK ---
              if args.exclude_repo_pattern and re.search(args.exclude_repo_pattern, args.repo_id, re.IGNORECASE):
                  print(f"Skipping repository '{args.repo_id}' because it matches exclusion pattern '{args.exclude_repo_pattern}'.")
                  organizer.logger.info("repo_skipped_exclusion", repo_id=args.repo_id, pattern=args.exclude_repo_pattern)
-                 # Exit gracefully or just return depending on desired behavior when excluded
-                 return # Exit the main function, effectively skipping the download
-             # --- END ADDED CHECK ---
+                 return
+
+             dl_kwargs = {}
+             if args.force_download:
+                 dl_kwargs['force_download'] = True
+                 dl_kwargs['resume_download'] = False
 
              path = organizer.download_recent(
                  repo_id=args.repo_id,
@@ -1299,7 +1276,10 @@ def main():
                  subfolder=args.subfolder,
                  revision=args.revision,
                  category=args.category,
-                 symlink_to_cache=not args.copy
+                 symlink_to_cache=not args.copy,
+                 allow_patterns=args.allow_patterns,
+                 ignore_patterns=args.ignore_patterns,
+                 **dl_kwargs
              )
              print(f"\nRecent file download process complete. Target directory: {path}")
 
@@ -1308,7 +1288,7 @@ def main():
             if args.cache_command == "scan":
                 cache_stats = organizer.get_cache_stats()
                 if args.json:
-                    print(json.dumps(cache_stats, indent=2))
+                    print(json.dumps(cache_stats, indent=2, default=str)) # Use default=str for datetime
                 else:
                     print(f"HF Cache Statistics (Profile: {args.profile or 'Default'}, Path: {organizer.effective_paths['HF_HUB_CACHE']}):")
                     print(f"-----------------------------------------------------")
@@ -1320,8 +1300,8 @@ def main():
 
                     if cache_stats['largest_snapshots']:
                          print("Largest snapshots (by revision):")
-                         headers = ["Repo ID", "Revision (Snapshot)", "Size"]
-                         table = [[s['repo_id'], s['revision'][:12], s['size_human']] for s in cache_stats['largest_snapshots']]
+                         headers = ["Repo ID", "Revision", "Size", "Last Modified"]
+                         table = [[s['repo_id'], s['revision'][:12], s['size_human'], s['last_modified']] for s in cache_stats['largest_snapshots']]
                          print(tabulate(table, headers=headers))
                          print()
                     else:
@@ -1332,6 +1312,7 @@ def main():
                          print("Storage by Organization:")
                          headers = ["Organization", "Size", "Snapshots", "% of Total"]
                          table = []
+                         # Show top 10 orgs + "Other" maybe? For now, show all.
                          for org in cache_stats['organizations']:
                              table.append([
                                  org['name'],
@@ -1342,6 +1323,10 @@ def main():
                          print(tabulate(table, headers=headers))
 
             elif args.cache_command == "clean":
+                if args.older_than is None and args.min_size is None:
+                     print("Error: At least one criteria (--older-than DAYS or --min-size MB) must be provided for cleaning.")
+                     exit(1)
+
                 removed_count, freed_bytes, removed_details = organizer.clean_cache(
                     older_than_days=args.older_than,
                     min_size_mb=args.min_size,
@@ -1351,7 +1336,7 @@ def main():
                 print(f"{action_verb} {removed_count} snapshots, freeing {humanize.naturalsize(freed_bytes)}.")
 
                 if args.json:
-                     print(json.dumps(removed_details, indent=2))
+                     print(json.dumps(removed_details, indent=2, default=str)) # Use default=str for datetime
                 elif removed_details:
                      print(f"\n{action_verb.capitalize()} snapshots:")
                      headers = ["Repo ID", "Revision", "Size", "Last Modified"]
@@ -1363,28 +1348,30 @@ def main():
             downloads = organizer.list_downloads(
                 limit=args.limit,
                 category=args.category,
-                # profile_filter=args.filter_profile # Add if implementing cross-profile listing
+                profile_filter=args.filter_profile
             )
 
             if args.json:
-                print(json.dumps(downloads, indent=2))
+                print(json.dumps(downloads, indent=2, default=str)) # Use default=str for datetime
             else:
+                profile_name = args.filter_profile or args.profile or 'Default'
                 if not downloads:
-                    print(f"No download history found for profile '{args.profile or 'Default'}'.")
-                    print(f"(Metadata file: {os.path.join(organizer.structured_root, '.metadata', 'downloads.json')})")
+                    print(f"No download history found for profile '{profile_name}'.")
+                    # Show path based on active profile if no filter used
+                    active_root = organizer.structured_root if not args.filter_profile else f"(root for profile '{args.filter_profile}')"
+                    print(f"(Metadata file expected in: {os.path.join(active_root, '.metadata', 'downloads.json')})")
 
                 else:
-                    print(f"Download History (Profile: {args.profile or 'Default'}, Max: {args.limit}):")
-                    headers = ["Timestamp", "Repo ID", "Type", "Category", "Profile", "Subfolder", "Rel Path"]
+                    print(f"Download History (Profile: {profile_name}, Max: {args.limit}):")
+                    headers = ["Timestamp", "Repo ID", "Type", "Category", "Profile", "Revision", "Subfolder", "Rel Path"]
                     table = []
                     for item in downloads:
                         ts = "N/A"
                         try:
-                             # Parse and format timestamp robustly
-                             dt_obj = datetime.datetime.fromisoformat(item.get("timestamp", "")).astimezone(None) # Convert to local
+                             dt_obj = datetime.datetime.fromisoformat(item.get("timestamp", "")).astimezone(None)
                              ts = dt_obj.strftime("%Y-%m-%d %H:%M")
                         except (ValueError, TypeError):
-                             ts = item.get("timestamp", "Invalid Date")[:16] # Fallback
+                             ts = item.get("timestamp", "Invalid Date")[:16]
 
                         table.append([
                             ts,
@@ -1392,64 +1379,55 @@ def main():
                             item.get("type", "N/A"),
                             item.get("category", "N/A"),
                             item.get("profile", "N/A"),
+                            item.get("revision", "N/A")[:12], # Shorten revision
                             item.get("subfolder", "-"),
                             item.get("relative_path", "N/A")
                         ])
-                    print(tabulate(table, headers=headers, maxcolwidths=[None, None, 15, None, None, 10, 25])) # Adjust widths
+                    print(tabulate(table, headers=headers, maxcolwidths=[None, None, 15, None, None, 12, 10, 25]))
 
         elif args.command == "overview":
             overview = organizer.get_organization_overview()
             if args.json:
-                print(json.dumps(overview, indent=2))
+                print(json.dumps(overview, indent=2, default=str)) # Use default=str for datetime
             else:
                 print(f"Organization Overview (Profile: {args.profile or 'Default'}, Root: {organizer.effective_paths['structured_root']})")
                 print(f"-----------------------------------------------------")
-                print(f"Total Organized Size: {overview.get('total_size_human', '0 B')}")
+                print(f"Total Organized Size: {overview.get('total_size_human', '0 B')} (excluding symlinks)")
                 print()
 
                 categories = overview.get('categories', {})
                 if not categories:
                      print("No categories found in the organized directory.")
                 else:
-                     # Sort categories alphabetically for consistent output
                      sorted_categories = sorted(categories.items())
-
                      for category, cat_data in sorted_categories:
                          print(f"--- Category: {category} ({cat_data.get('size_human', '0 B')}) ---")
-
                          orgs_data = cat_data.get('organizations', {})
                          if not orgs_data:
-                              print("  No organizations found in this category.")
-                              print()
-                              continue
-
-                         # Sort organizations by size within the category
-                         sorted_orgs = sorted(orgs_data.items(), key=lambda item: item[1].get('size_bytes', 0), reverse=True)
-
-                         headers = ["Organization", "Size", "Repositories"]
-                         table = []
-                         for org_name, org_info in sorted_orgs:
-                              table.append([
-                                   org_name,
-                                   org_info.get('size_human', '0 B'),
-                                   org_info.get('repo_count', 0)
-                              ])
-                         print(tabulate(table, headers=headers, tablefmt="plain")) # Use plain for less clutter
+                              print("  No organizations/namespaces found.")
+                         else:
+                              sorted_orgs = sorted(orgs_data.items(), key=lambda item: item[1].get('size_bytes', 0), reverse=True)
+                              headers = ["Organization/Namespace", "Size", "Repositories"]
+                              table = [[name, org_info.get('size_human', '0 B'), org_info.get('repo_count', 0)] for name, org_info in sorted_orgs]
+                              print(tabulate(table, headers=headers, tablefmt="plain"))
                          print()
 
 
     except RepositoryNotFoundError as e:
-         # Handle specific errors gracefully - This should now work
          organizer.logger.error("command_failed_repo_not_found", repo_id=getattr(args, 'repo_id', 'N/A'), error=str(e))
          print(f"Error: Repository not found: {getattr(args, 'repo_id', 'N/A')}")
          exit(1)
+    except HfHubHTTPError as http_err:
+         organizer.logger.error("command_failed_http_error", command=args.command, status=http_err.response.status_code, error=str(http_err))
+         print(f"\nAn HTTP error occurred: Status {http_err.response.status_code} - {http_err}")
+         if http_err.response.status_code == 401:
+              print("Hint: Check if your HF_TOKEN is valid and has the necessary permissions.")
+         exit(1)
     except Exception as e:
-         # Log the full traceback for unexpected errors
          organizer.logger.exception("command_failed_unexpected", command=args.command, error=str(e))
          print(f"\nAn unexpected error occurred: {e}")
          print("Check logs or run with --verbose for more details.")
          exit(1)
-
 
 if __name__ == "__main__":
     main()
