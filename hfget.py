@@ -13,41 +13,52 @@ import re  # Import regex for case-insensitive check
 
 try:
     import structlog
+
+    # --- FIX 3: Add list_repo_files_info to imports ---
     from huggingface_hub import (
         HfApi,
         snapshot_download,
         hf_hub_download,
         scan_cache_dir,
-        list_repo_files_info,
+        list_repo_files_info,  # <-- Added import
     )
-
-    # --- FIX 1: Import RepositoryNotFoundError ---
     from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
     from huggingface_hub.hf_api import RepoFile
 except ImportError:
     missing = []
-    # --- FIX 1: Add RepositoryNotFoundError to the check list ---
+    # Check main libraries first
     for lib in ["structlog", "huggingface_hub", "tabulate", "humanize"]:
         try:
-            # Check if the main library exists
             __import__(lib)
-            # Specifically check if RepositoryNotFoundError can be imported if huggingface_hub exists
-            if lib == "huggingface_hub":
-                from huggingface_hub.utils import RepositoryNotFoundError
         except ImportError:
-            # Append the library name if it's missing
             if lib not in missing:
                 missing.append(lib)
-            # If huggingface_hub is present but the specific exception is missing (unlikely but possible)
-            elif (
-                lib == "huggingface_hub" and "RepositoryNotFoundError" not in globals()
-            ):
-                missing.append(f"{lib} (or specific utils/errors submodule)")
+
+    # If huggingface_hub seems present, check for specific components needed
+    if "huggingface_hub" not in missing:
+        try:
+            from huggingface_hub.utils import RepositoryNotFoundError
+        except ImportError:
+            missing.append("huggingface_hub.utils (RepositoryNotFoundError)")
+        try:
+            # --- FIX 3: Also check list_repo_files_info here ---
+            from huggingface_hub import list_repo_files_info
+        except ImportError:
+            missing.append("huggingface_hub (list_repo_files_info)")
+        try:
+            from huggingface_hub.hf_api import RepoFile
+        except ImportError:
+            missing.append("huggingface_hub.hf_api (RepoFile)")
 
     if missing:
+        # Make suggestion more robust
+        install_libs = set()
+        for m in missing:
+            lib_name = m.split(" ")[0].split(".")[0]  # Get base library name
+            install_libs.add(lib_name)
         raise ImportError(
-            f"Required libraries not found: {', '.join(missing)}. Install/update with: pip install --upgrade {' '.join(m.split(' ')[0] for m in missing)}"
-        )  # Suggest upgrade
+            f"Required libraries/components not found: {', '.join(missing)}. Install/update with: pip install --upgrade {' '.join(install_libs)}"
+        )
 
 
 class HfHubOrganizer:
@@ -338,9 +349,8 @@ class HfHubOrganizer:
             if "/" in repo_id:
                 namespace, repo_name = repo_id.split("/", 1)
                 try:
-                    # --- FIX 2: Use api.repo_type() instead of repo_info.repo_type ---
+                    # Use api.repo_type() which is the correct method
                     repo_type = self.api.repo_type(repo_id=repo_id)
-                    # --- End FIX 2 ---
                     if repo_type == "dataset":
                         repo_type_guess = "datasets"
                     elif repo_type == "space":
@@ -353,15 +363,15 @@ class HfHubOrganizer:
                         category=repo_type_guess,
                     )
                 except RepositoryNotFoundError:
-                    # This exception should now be defined thanks to FIX 1
                     self.logger.error("repo_not_found_api", repo_id=repo_id)
                     raise  # Re-raise the specific error
                 except Exception as e:
-                    # Fallback if API call fails for other reasons
+                    # Log the actual error here for better debugging
                     self.logger.warning(
                         "category_detection_failed_api",
                         repo_id=repo_id,
                         error=str(e),
+                        error_type=type(e).__name__,
                         fallback=repo_type_guess,
                     )
             else:
@@ -406,14 +416,33 @@ class HfHubOrganizer:
                 self.logger.debug("removed_existing_target", path=org_path)
             elif os.path.isdir(org_path):
                 # Ensure we are not removing the cache path itself if symlinking fails
-                if not os.path.samefile(
-                    os.path.realpath(org_path), os.path.realpath(cache_path)
-                ):
+                # Use realpath to resolve symlinks before comparison
+                try:
+                    if not os.path.samefile(
+                        os.path.realpath(org_path), os.path.realpath(cache_path)
+                    ):
+                        shutil.rmtree(org_path)
+                        self.logger.debug("removed_existing_target_dir", path=org_path)
+                    else:
+                        self.logger.warning(
+                            "skipping_removal_target_is_cache", path=org_path
+                        )
+                except FileNotFoundError:
+                    # If realpath fails (e.g., broken link target), safe to remove the link/dir itself
                     shutil.rmtree(org_path)
-                    self.logger.debug("removed_existing_target_dir", path=org_path)
-                else:
+                    self.logger.debug(
+                        "removed_existing_broken_link_or_dir", path=org_path
+                    )
+                except OSError as e:
+                    self.logger.error(
+                        "error_comparing_paths_before_removal",
+                        org_path=org_path,
+                        cache_path=cache_path,
+                        error=str(e),
+                    )
+                    # Decide whether to proceed with removal or raise error - safer to skip removal
                     self.logger.warning(
-                        "skipping_removal_target_is_cache", path=org_path
+                        "skipping_removal_due_to_path_comparison_error", path=org_path
                     )
 
         os.makedirs(os.path.dirname(org_path), exist_ok=True)  # Ensure parent exists
@@ -533,18 +562,38 @@ class HfHubOrganizer:
                         os.remove(final_organized_path)
                     elif os.path.isdir(final_organized_path):
                         # Check if it points to the cache before removing
-                        if not os.path.samefile(
-                            os.path.realpath(final_organized_path),
-                            os.path.realpath(downloaded_path_in_cache),
-                        ):
-                            shutil.rmtree(final_organized_path)
+                        try:
+                            if not os.path.samefile(
+                                os.path.realpath(final_organized_path),
+                                os.path.realpath(downloaded_path_in_cache),
+                            ):
+                                shutil.rmtree(final_organized_path)
+                                self.logger.debug(
+                                    "removed_existing_target_dir_for_snapshot",
+                                    path=final_organized_path,
+                                )
+                            else:
+                                self.logger.warning(
+                                    "skipping_removal_snapshot_target_is_cache",
+                                    path=final_organized_path,
+                                )
+                        except FileNotFoundError:
+                            shutil.rmtree(
+                                final_organized_path
+                            )  # Remove broken link/dir
                             self.logger.debug(
-                                "removed_existing_target_dir_for_snapshot",
+                                "removed_existing_broken_link_or_dir_snapshot",
                                 path=final_organized_path,
                             )
-                        else:
+                        except OSError as e:
+                            self.logger.error(
+                                "error_comparing_paths_snapshot",
+                                org_path=final_organized_path,
+                                cache_path=downloaded_path_in_cache,
+                                error=str(e),
+                            )
                             self.logger.warning(
-                                "skipping_removal_snapshot_target_is_cache",
+                                "skipping_removal_due_to_path_comparison_error_snapshot",
                                 path=final_organized_path,
                             )
 
@@ -633,6 +682,7 @@ class HfHubOrganizer:
 
             # Get file info including commit details
             # Use token explicitly if needed, otherwise API client uses env var
+            # --- This call should now work because list_repo_files_info is imported ---
             all_files_info: List[RepoFile] = list_repo_files_info(
                 repo_id=repo_id,
                 revision=revision,
