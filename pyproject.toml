@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hfget"
+version = "0.1.1"
+description = "A tool to download, organize, and manage Hugging Face Hub models, datasets, and cache."
+readme = "README.md"
+authors = [
+    { name = "Your Name", email = "your.email@example.com" } # Please update author info
+]
+license = {text = "Apache-2.0"}
+requires-python = ">=3.8"
+dependencies = [
+    "huggingface_hub>=0.18.0",
+    "structlog>=23.0.0",
+    "humanize>=4.0.0",
+    "tabulate>=0.9.0",
+    "requests"
+]
+
+[project.urls]
+Homepage = "https://github.com/fblissjr/hfget" # Please update URL
+Issues = "https://github.com/fblissjr/hfget/issues" # Please update URL
+
+[project.scripts]
+# 'hfget' command will run the 'main' function in 'hfget.cli' module
+hfget = "hfget.cli:main"
+
+[project.optional-dependencies]
+web = [
+    "Flask>=2.0.0"
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["hfget"]

@@ -17,12 +17,12 @@ from huggingface_hub import (
     HfApi,
     snapshot_download,
     hf_hub_download,
-    list_repo_files_info,
+    list_repo_files,
     scan_cache_dir,
-    CacheInfo,
+    HFCacheInfo,
     CommitInfo,
-    RepoFile
 )
+from huggingface_hub.hf_api import RepoFile # 
 from huggingface_hub.utils import RepositoryNotFoundError, HfHubHTTPError, hf_raise_for_status
 
 # --- Configuration ---
@@ -533,7 +533,7 @@ class HfHubOrganizer:
             cutoff_date = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days_ago)
             self.logger.debug("filtering_commits_since", cutoff_date=cutoff_date.isoformat(), **log_ctx)
 
-            all_files_info: List[RepoFile] = list_repo_files_info(
+            all_files_info: List[RepoFile] = list_repo_files(
                 repo_id=repo_id, revision=revision, token=self.api.token
             )
             self.logger.debug("retrieved_repo_file_info", count=len(all_files_info), **log_ctx)

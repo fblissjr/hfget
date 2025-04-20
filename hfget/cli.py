@@ -10,7 +10,7 @@ import datetime # Import datetime for type hint and usage in list command
 
 # Import the core class from the other file
 # Assuming hf_organizer_core.py is in the same directory or Python path
-from hf_organizer_core import HfHubOrganizer, DEFAULT_CONFIG_PATH, DEFAULT_STRUCTURED_ROOT, FALLBACK_HF_HOME
+from hfget.core import HfHubOrganizer, DEFAULT_CONFIG_PATH, DEFAULT_STRUCTURED_ROOT, FALLBACK_HF_HOME
 from huggingface_hub.utils import RepositoryNotFoundError, HfHubHTTPError
 import structlog # Use structlog for getting logger
 
