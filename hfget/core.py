@@ -579,7 +579,11 @@ class HfHubOrganizer:
 
             recent_files_to_download: List[RepoFile] = []
             for file_info in all_files_info:
-                is_recent = file_info.last_commit and file_info.last_commit.date and file_info.last_commit.date > cutoff_date
+                is_recent = (
+                    file_info.lastCommit
+                    and file_info.last_commit.date
+                    and file_info.last_commit.date > cutoff_date
+                )
                 if not is_recent: continue
 
                 in_subfolder = True
