@@ -7,6 +7,7 @@ import re
 from tabulate import tabulate
 import humanize
 import datetime # Import datetime for type hint and usage in list command
+import traceback
 
 # Import the core class from the other file
 # Assuming hf_organizer_core.py is in the same directory or Python path
@@ -138,22 +139,26 @@ def main():
         # Let's instantiate anyway, it handles config loading.
         organizer = HfHubOrganizer(
             profile=args.profile,
-            base_path=base_path_override,
-            structured_root=out_dir_override,
-            enable_hf_transfer=enable_hf_transfer_flag,
+            # Use the arguments with '_override' suffix
+            base_path_override=base_path_override,
+            structured_root_override=out_dir_override,
+            enable_hf_transfer_override=enable_hf_transfer_flag,
+            # Token override is typically not passed via CLI for security
+            # token_override=None, # Explicitly None if needed
             verbose=args.verbose,
             config_path=args.config,
-            log_format=args.log_format
+            log_format=args.log_format,
         )
-    except ValueError as e:
-        # Handle profile not found during init
-        print(f"Error: {e}", file=sys.stderr)
-        logger.error("init_failed", error=str(e))
-        exit(1)
-    except Exception as e:
+        # --- ^^^^ THIS IS THE CORRECTED CALL ^^^^ ---
+
+    except ValueError as e:  # Catch specific init errors like profile not found
+        # Logger might not be fully initialized here, use print
+        print(f"Error initializing: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:  # Catch unexpected init errors
         print(f"Unexpected error during initialization: {e}", file=sys.stderr)
-        logger.exception("unexpected_init_failed", error=str(e))
-        exit(1)
+        traceback.print_exc()  # Print traceback for unexpected errors during init
+        sys.exit(1)
 
     # --- Execute Command ---
     try:
@@ -349,4 +354,6 @@ def main():
          exit(1)
 
 if __name__ == "__main__":
+    import traceback  # Needed for printing traceback on init failure
+
     main()
